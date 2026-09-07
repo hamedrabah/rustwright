@@ -23,7 +23,10 @@ as one JSON value, and returns the core JSON wire value decoded to a native
 value. `screenshot` returns encoded bytes. Timeout values are milliseconds.
 
 The language-facing option names and behavior match the Node alpha surface.
-The C launch JSON is the normalized core wire shape: `headless`,
+The core launch parser accepts canonical snake_case fields and the current
+camelCase aliases `executablePath`, `ignoreAllDefaultArgs`, `ignoreDefaultArgs`,
+`userDataDir`, and `chromiumSandbox`. C callers should emit canonical snake_case
+keys. The C launch JSON uses the normalized core wire shape: `headless`,
 `executable_path`, `channel`, `args`, `ignore_all_default_args`,
 `ignore_default_args`, `timeout`, `user_data_dir`, `env`, `chromium_sandbox`,
 and `proxy`. Screenshot JSON uses the Node names `path`, `fullPage`, `clip`,
@@ -36,6 +39,28 @@ Opaque handles have no public layout:
 ```c
 typedef struct RwBrowser RwBrowser;
 typedef struct RwPage RwPage;
+typedef struct RwWireGraph RwWireGraph;
+typedef size_t RwWireNodeId;
+typedef int32_t RwWireNodeKind;
+#define RW_WIRE_NODE_NULL 0
+#define RW_WIRE_NODE_BOOL 1
+#define RW_WIRE_NODE_SIGNED 2
+#define RW_WIRE_NODE_UNSIGNED 3
+#define RW_WIRE_NODE_FLOAT 4
+#define RW_WIRE_NODE_STRING 5
+#define RW_WIRE_NODE_ARRAY 6
+#define RW_WIRE_NODE_OBJECT 7
+#define RW_WIRE_NODE_LEAF 8
+typedef int32_t RwWireLeafKind;
+#define RW_WIRE_LEAF_UNSERIALIZABLE 0
+#define RW_WIRE_LEAF_BIGINT 1
+#define RW_WIRE_LEAF_DATE 2
+#define RW_WIRE_LEAF_REGEXP 3
+#define RW_WIRE_LEAF_URL 4
+#define RW_WIRE_LEAF_ERROR 5
+#define RW_WIRE_LEAF_UNDEFINED 6
+#define RW_WIRE_LEAF_SYMBOL 7
+#define RW_WIRE_LEAF_FUNCTION 8
 ```
 
 The complete exported ABI is:
@@ -45,6 +70,66 @@ The complete exported ABI is:
 const char *rw_last_error(void);
 void rw_string_free(char *s);
 void rw_bytes_free(uint8_t *buf, size_t len);
+
+/* evaluate wire */
+int32_t rw_decode_wire(const char *wire_json, char **out_json);
+int32_t rw_wire_graph_parse(const char *wire_json,
+                            RwWireGraph **out_graph);
+void rw_wire_graph_free(RwWireGraph *graph);
+int32_t rw_wire_graph_node_count(const RwWireGraph *graph,
+                                 size_t *out_count);
+int32_t rw_wire_graph_root(const RwWireGraph *graph,
+                           RwWireNodeId *out_root);
+int32_t rw_wire_graph_node_kind(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                RwWireNodeKind *out_kind);
+int32_t rw_wire_graph_get_bool(const RwWireGraph *graph,
+                               RwWireNodeId node,
+                               int32_t *out_value);
+int32_t rw_wire_graph_get_signed(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 int64_t *out_value);
+int32_t rw_wire_graph_get_unsigned(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   uint64_t *out_value);
+int32_t rw_wire_graph_get_float(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                double *out_value);
+int32_t rw_wire_graph_get_string(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+int32_t rw_wire_graph_array_length(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   size_t *out_len);
+int32_t rw_wire_graph_array_child(const RwWireGraph *graph,
+                                  RwWireNodeId node,
+                                  size_t index,
+                                  RwWireNodeId *out_child);
+int32_t rw_wire_graph_object_length(const RwWireGraph *graph,
+                                    RwWireNodeId node,
+                                    size_t *out_len);
+int32_t rw_wire_graph_object_key(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 size_t index,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+int32_t rw_wire_graph_object_child(const RwWireGraph *graph,
+                                   RwWireNodeId node,
+                                   size_t index,
+                                   RwWireNodeId *out_child);
+int32_t rw_wire_graph_leaf_kind(const RwWireGraph *graph,
+                                RwWireNodeId node,
+                                RwWireLeafKind *out_kind);
+int32_t rw_wire_graph_leaf_field_count(const RwWireGraph *graph,
+                                       RwWireNodeId node,
+                                       size_t *out_count);
+int32_t rw_wire_graph_leaf_field(const RwWireGraph *graph,
+                                 RwWireNodeId node,
+                                 size_t index,
+                                 const uint8_t **out_data,
+                                 size_t *out_len);
+
 
 /* Chromium */
 int32_t rw_chromium_executable_path(char **out_path);
@@ -56,6 +141,16 @@ int32_t rw_browser_new_page(RwBrowser *b, RwPage **out_page);
 int32_t rw_browser_close(RwBrowser *b);
 char *rw_browser_ws_endpoint(RwBrowser *b);
 void rw_browser_free(RwBrowser *b);
+
+/* page timeout defaults */
+int32_t rw_page_set_default_timeout(RwPage *p, double timeout_ms_or_nan);
+int32_t rw_page_set_default_navigation_timeout(RwPage *p,
+                                               double timeout_ms_or_nan);
+int32_t rw_page_set_context_default_timeout(RwPage *p,
+                                            double timeout_ms_or_nan);
+int32_t rw_page_set_context_default_navigation_timeout(
+    RwPage *p,
+    double timeout_ms_or_nan);
 
 /* page */
 char *rw_page_target_id(RwPage *p);
@@ -149,20 +244,49 @@ arrays as `{ "__rustwright_cdp_array__": id, "items": [...] }` and objects as
 `{ "__rustwright_cdp_object__": id, "entries": {...} }`; recursively unwrap
 `items` and `entries`. It uses `__rustwright_cdp_ref__` for repeated/cyclic
 references and tagged objects for undefined, non-finite numbers, dates,
-regular expressions, URLs, errors, symbols, and functions. The core
-serializer is the single source of truth for this vocabulary; a binding maps
-the core's tags to its closest native representation and must not invent or
-assume tags the core does not emit. Manifest v1 expected/captured values are
-JSON-compatible and never require cycles; a runner must at least recursively
-decode array/object wrappers before capture or `assertEval` comparison.
+regular expressions, URLs, errors, symbols, and functions.
+
+The legacy core `decode_wire_value` and C ABI `rw_decode_wire` contract is
+flattened plain JSON. Array and object wrappers are removed, repeated
+non-cyclic references are duplicated, and references that form cycles become
+`{"__rustwright_cdp_cycle__": true}`. Leaf scalar tags remain in the output for
+binding-specific native mapping. This behavior is compatibility-stable.
+
+Identity-preserving bindings use `rw_wire_graph_parse`. They allocate all
+host containers by dense node id before they fill array and object edges.
+This preserves repeated references, cycles, and object entry order. PyO3 and
+napi use the same core graph directly. None of these adapters may substitute
+the flattened `rw_decode_wire` compatibility path.
+
+The core serializer is the single source of truth for this vocabulary; a
+binding maps the core's tags to its closest native representation and must not
+invent or assume tags the core does not emit. Manifest v1 expected/captured
+values are JSON-compatible and never require cycles; a runner must at least
+recursively decode array/object wrappers before capture or `assertEval`
+comparison.
+
+`RwWireGraph` is immutable and caller-owned. Borrowed string, object-key, and
+leaf-field byte views remain valid only until `rw_wire_graph_free`. Bindings
+must copy each view by its explicit length before graph release. The length can
+include embedded NUL bytes. Empty views use NULL plus zero.
+
+Node and leaf tag values are fixed in `capi/include/rustwright.h`, where both
+public kind aliases are `int32_t` rather than implementation-defined C enums.
+Leaf fields are positional: unserializable, bigint, date, and URL have one
+field; regexp has pattern then flags; error has name, message, then stack;
+undefined, symbol, and function have no fields.
 
 ### Thin-shim rule (single source of logic)
 
 Any behavior expressible as a pure function of JSON-in/JSON-out — launch and
-screenshot option normalization and defaulting, evaluate-wire decoding,
-timeout-precedence resolution, data-URL construction, and structural result
-comparison — is implemented once in `rustwright-core` and exposed through the
-C ABI (and napi/PyO3). A binding limits itself to:
+screenshot option normalization and defaulting, evaluate-wire parsing and
+decoding, timeout-precedence resolution, data-URL construction, and structural
+result comparison — is implemented once in `rustwright-core` and exposed
+through the C ABI and native PyO3/napi adapters.
+
+The legacy C ABI decoder intentionally remains a flattened JSON compatibility
+path. Native graph adapters use core graph parsing to preserve host identity
+and cycles. A binding limits itself to:
 
 - marshalling native values to and from the documented JSON wire shapes,
 - handle, memory, and thread ownership per this contract, and

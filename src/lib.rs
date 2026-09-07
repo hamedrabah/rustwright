@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::LazyLock;
 #[cfg(feature = "python")]
 use std::sync::OnceLock;
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -28,8 +28,11 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use pyo3::types::{PyAny, PyBytes, PyModule};
-use serde::{Deserialize, Serialize};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
+#[cfg(feature = "python")]
+use pyo3::IntoPyObjectExt;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
@@ -363,6 +366,7 @@ struct PendingCommandGuard {
     pending: CdpPendingMap,
     outstanding: CdpOutstandingMap,
     traffic_log: Arc<Mutex<CdpTrafficLog>>,
+    retention_gate: Arc<CdpRetentionGate>,
 }
 
 struct QueuedCdpCommand {
@@ -409,18 +413,25 @@ impl PendingCommandGuard {
         pending: &CdpPendingMap,
         outstanding: &CdpOutstandingMap,
         traffic_log: &Arc<Mutex<CdpTrafficLog>>,
+        retention_gate: &Arc<CdpRetentionGate>,
     ) -> Self {
         Self {
             id,
             pending: Arc::clone(pending),
             outstanding: Arc::clone(outstanding),
             traffic_log: Arc::clone(traffic_log),
+            retention_gate: Arc::clone(retention_gate),
         }
     }
 }
 
 impl Drop for PendingCommandGuard {
     fn drop(&mut self) {
+        let Some(_retention_guard) = self.retention_gate.lock_for_write() else {
+            self.pending.lock().unwrap().remove(&self.id);
+            self.outstanding.lock().unwrap().remove(&self.id);
+            return;
+        };
         let was_pending = self.pending.lock().unwrap().remove(&self.id).is_some();
         let outstanding = self.outstanding.lock().unwrap().remove(&self.id);
         if was_pending {
@@ -441,7 +452,12 @@ impl Drop for SpawnedTaskAbortGuard {
 }
 
 const CDP_EVENT_LOG_LIMIT: usize = 8192;
+const CDP_EVENT_LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CDP_EVENT_LOG_MAX_ENTRY_BYTES: usize = 64 * 1024;
+const CDP_RETAINED_STRING_MAX_BYTES: usize = 8 * 1024;
+const CDP_RETAINED_ARRAY_MAX_ITEMS: usize = 128;
 const CDP_DIAGNOSTIC_TRAFFIC_LIMIT: usize = 32;
+const CDP_EVENT_UNREPLAYABLE_MARKER: &str = "__rustwright_cdp_event_unreplayable";
 const CDP_DIAGNOSTIC_LIST_LIMIT: usize = 32;
 const CDP_DIAGNOSTIC_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const TIMEOUT_DIAGNOSTIC_BANNER: &str = "RUSTWRIGHT TIMEOUT DIAGNOSTIC";
@@ -1596,7 +1612,6 @@ struct LocatorDispatchScript {
 #[derive(Debug)]
 struct LocatorFastPathScript {
     body: String,
-    fill_guard_key: Option<String>,
 }
 
 fn locator_fill_apply_body(value: &str, strict: bool, forced: bool) -> RwResult<LocatorFillScript> {
@@ -1733,23 +1748,6 @@ fn simple_label_fast_spec(spec: &Value, explicit_index: bool) -> bool {
         )
 }
 
-fn simple_placeholder_fast_spec(spec: &Value, explicit_index: bool) -> bool {
-    !explicit_index
-        && spec.get("kind").and_then(Value::as_str) == Some("placeholder")
-        && spec.get("value").and_then(Value::as_str).is_some()
-}
-
-fn fast_fill_body(args: &Value) -> RwResult<LocatorFillScript> {
-    let value = args.get("value").and_then(Value::as_str).ok_or_else(|| {
-        RwError::InvalidInput("locator fast fill value must be a string".to_string())
-    })?;
-    locator_fill_apply_body(
-        value,
-        args.get("strict").and_then(Value::as_bool).unwrap_or(false),
-        args.get("forced").and_then(Value::as_bool).unwrap_or(false),
-    )
-}
-
 fn locator_fast_path_body(
     locator_json: &str,
     operation: &str,
@@ -1768,7 +1766,6 @@ fn locator_fast_path_body(
         .get("explicit_index")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut fill_guard_key = None;
     let body = match operation {
         "css_count" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_COUNT_BODY.to_string()),
         "css_text" if simple_css_fast_spec(&spec) => Some(LOCATOR_FAST_TEXT_BODY.to_string()),
@@ -1790,11 +1787,6 @@ fn locator_fast_path_body(
         }
         "css_input_value" if simple_css_fast_spec(&spec) => {
             Some(LOCATOR_FAST_INPUT_VALUE_BODY.to_string())
-        }
-        "css_fill" if !explicit_index && simple_css_fast_spec(&spec) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
         }
         "css_immediate_state" if simple_css_fast_spec(&spec) => {
             let state = args.get("state").and_then(Value::as_str);
@@ -1825,16 +1817,6 @@ fn locator_fast_path_body(
         "label_attribute" if simple_label_fast_spec(&spec, explicit_index) => {
             Some(LOCATOR_FAST_ATTRIBUTE_BODY.to_string())
         }
-        "label_fill" if simple_label_fast_spec(&spec, explicit_index) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
-        }
-        "placeholder_fill" if simple_placeholder_fast_spec(&spec, explicit_index) => {
-            let fill = fast_fill_body(&args)?;
-            fill_guard_key = Some(fill.guard_key);
-            Some(fill.body)
-        }
         _ => None,
     };
     let Some(body) = body else {
@@ -1847,21 +1829,10 @@ fn locator_fast_path_body(
     ) {
         effective_args["strict"] = Value::Bool(false);
     }
-    let body = if fill_guard_key.is_some() {
-        // Fill owns its strictness ordering: a retained dispatch must be observed before
-        // element-count strictness is considered. Wrapping it in the generic fast-path
-        // preflight would inspect a page-created duplicate before the fill guard can
-        // confirm the already-dispatched edit.
-        body
-    } else {
-        LOCATOR_FAST_PATH_TEMPLATE
-            .replace("__ARGS__", &effective_args.to_string())
-            .replace("__BODY__", &body)
-    };
-    Ok(Some(LocatorFastPathScript {
-        body,
-        fill_guard_key,
-    }))
+    let body = LOCATOR_FAST_PATH_TEMPLATE
+        .replace("__ARGS__", &effective_args.to_string())
+        .replace("__BODY__", &body);
+    Ok(Some(LocatorFastPathScript { body }))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7419,10 +7390,146 @@ multiline-compatible = """4.5.6"""
 
     #[test]
     fn chromium_default_launch_args_disable_system_keychains() {
-        let args = chromium_default_launch_args(&LaunchOptions::default());
+        let args = chromium_effective_launch_args(&LaunchOptions::default());
 
         assert!(args.iter().any(|arg| arg == "--password-store=basic"));
         assert!(args.iter().any(|arg| arg == "--use-mock-keychain"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--disable-blink-features=AutomationControlled"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--enable-features=CDPScreenshotNewSurface"));
+        for switch in [
+            "--disable-back-forward-cache",
+            "--disable-extensions",
+            "--disable-component-update",
+            "--disable-field-trial-config",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--disable-sync",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-ipc-flooding-protection",
+            "--disable-breakpad",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-extensions-with-background-pages",
+            "--allow-pre-commit-input",
+            "--force-color-profile=srgb",
+            "--disable-search-engine-choice-screen",
+        ] {
+            assert!(args.iter().any(|arg| arg == switch), "missing {switch}");
+        }
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.starts_with("--disable-features="))
+                .count(),
+            1
+        );
+        assert!(args.iter().any(|arg| {
+            arg == "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay"
+        }));
+    }
+
+    #[test]
+    fn chromium_effective_launch_args_merge_feature_lists() {
+        let expected_default = vec![
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-renderer-backgrounding",
+            "--disable-popup-blocking",
+            "--disable-prompt-on-repost",
+            "--disable-back-forward-cache",
+            "--disable-extensions",
+            "--disable-component-update",
+            "--disable-field-trial-config",
+            "--metrics-recording-only",
+            "--no-service-autorun",
+            "--disable-sync",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-ipc-flooding-protection",
+            "--disable-breakpad",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-extensions-with-background-pages",
+            "--allow-pre-commit-input",
+            "--force-color-profile=srgb",
+            "--disable-search-engine-choice-screen",
+            "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay",
+            "--enable-features=CDPScreenshotNewSurface",
+            "--mute-audio",
+            "--headless=new",
+            "--hide-scrollbars",
+            "--no-sandbox",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            chromium_effective_launch_args(&LaunchOptions::default()),
+            expected_default
+        );
+
+        let mut user_features = LaunchOptions::default();
+        user_features.args = vec![
+            "--disable-features=UserFeature,DialMediaRouteProvider".to_string(),
+            "--enable-features=UserEnabled,CDPScreenshotNewSurface".to_string(),
+            "--disable-blink-features=UserBlink,AutomationControlled".to_string(),
+        ];
+        let mut expected_user_features = expected_default.clone();
+        expected_user_features[7] =
+            "--disable-blink-features=AutomationControlled,UserBlink".to_string();
+        expected_user_features[27] = "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay,UserFeature".to_string();
+        expected_user_features[28] =
+            "--enable-features=CDPScreenshotNewSurface,UserEnabled".to_string();
+        assert_eq!(
+            chromium_effective_launch_args(&user_features),
+            expected_user_features
+        );
+
+        let mut selective_ignore = LaunchOptions::default();
+        selective_ignore.ignore_default_args = vec!["--disable-features".to_string()];
+        selective_ignore.args = vec!["--disable-features=SelectiveProbe".to_string()];
+        let mut expected_selective_ignore = expected_default.clone();
+        expected_selective_ignore.remove(27);
+        expected_selective_ignore.push("--disable-features=SelectiveProbe".to_string());
+        assert_eq!(
+            chromium_effective_launch_args(&selective_ignore),
+            expected_selective_ignore
+        );
+
+        let mut ignore_all = LaunchOptions::default();
+        ignore_all.ignore_all_default_args = true;
+        ignore_all.args = vec![
+            "--disable-features=First,First".to_string(),
+            "--disable-features=Second".to_string(),
+            "--enable-features=UserEnabled".to_string(),
+        ];
+        assert_eq!(chromium_effective_launch_args(&ignore_all), ignore_all.args);
+    }
+
+    #[test]
+    fn browser_context_defaults_create_disposable_native_contexts() {
+        let params = browser_context_create_params(None).unwrap();
+
+        assert_eq!(params["disposeOnDetach"], true);
+    }
+
+    #[test]
+    fn navigation_history_expression_drains_both_named_buffers() {
+        let expression = navigation_history_expression("console-buffer", "page-errors");
+
+        assert!(expression.contains("console-buffer"));
+        assert!(expression.contains("page-errors"));
+        assert!(expression.contains("console: drain"));
+        assert!(expression.contains("page_errors: drain"));
+        assert_eq!(expression.matches("splice(0, history.length)").count(), 1);
     }
 
     #[test]
@@ -7724,25 +7831,6 @@ multiline-compatible = """4.5.6"""
         )
         .unwrap()
         .is_some());
-
-        let fill = locator_fast_path_body(
-            r##"{"kind":"css","selector":"#target"}"##,
-            "css_fill",
-            r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"committed","forced":false}"#,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(fill.fill_guard_key.is_some());
-        assert!(!fill.body.contains("const fastArgs ="));
-        assert!(
-            fill.body
-                .find("const pendingFillGuard")
-                .expect("fill guard observation")
-                < fill
-                    .body
-                    .find("if (strict && (strictFrameViolation || matches.length > 1))")
-                    .expect("fill strictness")
-        );
     }
 
     #[test]
@@ -8001,99 +8089,6 @@ multiline-compatible = """4.5.6"""
         );
     }
 
-    #[cfg(feature = "python")]
-    #[tokio::test]
-    async fn fast_path_post_dispatch_fill_timeout_has_settle_metadata() {
-        Python::initialize();
-        let (page, mut peer) = input_protocol_page(Some("Ada"));
-        let page = PyPage { inner: page.inner };
-        peer.allow_close = true;
-        peer.pending_fill_confirmation = true;
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = Python::attach(|py| {
-                page.locator_fast_path(
-                    py,
-                    r##"{"kind":"css","selector":"#target"}"##,
-                    0,
-                    "css_fill",
-                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"Ada","forced":false}"#,
-                    Some(60.0),
-                )
-            });
-            let _ = result_tx.send(result.map_err(|error| error.to_string()));
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let error = loop {
-            if let Ok(result) = result_rx.try_recv() {
-                break result.expect_err("configured fast fill must time out");
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "real fast fill timeout did not finish"
-            );
-            let _ = tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await;
-        };
-        let marker = error
-            .find(ACTION_TIMEOUT_MARKER)
-            .expect("PyErr must contain the structured ActionTimeout marker");
-        let Some(FfiWireError::ActionTimeout(payload)) = FfiWireError::parse(&error[marker..])
-        else {
-            panic!("fast fill must preserve structured ActionTimeout: {error}");
-        };
-        assert_eq!(payload.phase, Some(FailurePhase::Settle));
-        assert_eq!(payload.command_written, Some(CommandWritten::Yes));
-        assert_eq!(payload.retryable, Some(false));
-    }
-
-    #[cfg(feature = "python")]
-    #[tokio::test]
-    async fn fast_path_retryable_tracked_timeout_cleans_retained_fill_guard() {
-        Python::initialize();
-        let (page, mut peer) = input_protocol_page(Some(""));
-        let page = PyPage { inner: page.inner };
-        peer.allow_close = true;
-        peer.fail_delete_before_begin = true;
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = Python::attach(|py| {
-                page.locator_fast_path(
-                    py,
-                    r##"{"kind":"css","selector":"#target"}"##,
-                    0,
-                    "css_fill",
-                    r#"{"strict":true,"explicit_index":false,"has_handlers":false,"value":"","forced":false}"#,
-                    Some(60.0),
-                )
-            });
-            let _ = result_tx.send(result.map_err(|error| error.to_string()));
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut commands = Vec::new();
-        let error = loop {
-            if let Ok(result) = result_rx.try_recv() {
-                break result.expect_err("configured fast fill dispatch must fail");
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "fast fill cleanup regression did not finish"
-            );
-            if let Ok(command) =
-                tokio::time::timeout(Duration::from_millis(150), peer.next_command()).await
-            {
-                commands.push(command);
-            }
-        };
-        assert!(
-            error.contains(TIMEOUT_MARKER)
-                && error.contains(r#""command_written":"no","retryable":true"#),
-            "tracked timeout must retain its structured metadata: {error}"
-        );
-        assert!(commands.iter().any(|command| {
-            input_command_expression(command)
-                .is_some_and(|expression| expression.contains("guard.cleanup()"))
-        }));
-    }
     #[test]
     fn ffi_wire_error_markers_round_trip_with_closed_payload_schemas() {
         let action_timeout = |evidence: FillAttemptEvidence| {
@@ -9277,7 +9272,7 @@ multiline-compatible = """4.5.6"""
                     .await
                     .map(Some)
                 },
-                |_| async { Ok(()) },
+                |_| async { Ok(DragOutcome::NoInterceptedDrop) },
             ),
             async {
                 let mut commands = Vec::new();
@@ -9308,6 +9303,147 @@ multiline-compatible = """4.5.6"""
         assert_eq!(cleanup_commands[1]["params"]["type"], "mouseReleased");
         assert_eq!(cleanup_commands[1]["params"]["buttons"], 0);
         assert_eq!(cleanup_commands[1]["sessionId"], "pointer-session");
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    fn new_drag_test_client() -> (CdpClient, mpsc::UnboundedReceiver<CdpOutgoing>) {
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(4);
+        let (alive_tx, _) = watch::channel(true);
+        (
+            CdpClient {
+                write_tx,
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                outstanding: Arc::new(Mutex::new(HashMap::new())),
+                events,
+                event_log: Arc::new(Mutex::new(CdpEventLog::new())),
+                traffic_log: Arc::new(Mutex::new(CdpTrafficLog::new())),
+                runtime_state: Arc::new(Mutex::new(CdpRuntimeState::new(None))),
+                next_id: AtomicU64::new(1),
+                sent_runtime_enable_count: AtomicU64::new(0),
+                sent_target_close_count: AtomicU64::new(0),
+                sent_context_dispose_count: AtomicU64::new(0),
+                sent_get_frame_tree_count: AtomicU64::new(0),
+                alive: Arc::new(AtomicBool::new(true)),
+                alive_tx,
+            },
+            write_rx,
+        )
+    }
+
+    async fn collect_drag_test_commands(
+        client: &CdpClient,
+        write_rx: &mut mpsc::UnboundedReceiver<CdpOutgoing>,
+        count: usize,
+    ) -> Vec<Value> {
+        let mut commands = Vec::new();
+        for _ in 0..count {
+            let command = match write_rx.recv().await.unwrap() {
+                CdpOutgoing::Text { payload, .. } => {
+                    serde_json::from_str::<Value>(&payload).unwrap()
+                }
+                CdpOutgoing::Close => panic!("unexpected transport close"),
+            };
+            dispatch_cdp_payload(
+                json!({ "id": command["id"], "result": {} }),
+                Arc::clone(&client.pending),
+                client.events.clone(),
+                Arc::clone(&client.event_log),
+            );
+            commands.push(command);
+        }
+        commands
+    }
+
+    #[tokio::test]
+    async fn intercepted_drag_success_skips_mouse_release() {
+        let (client, mut write_rx) = new_drag_test_client();
+        let client_for_completion = &client;
+        let (result, commands) = tokio::join!(
+            run_drag_with_cleanup(
+                &client,
+                "root-session",
+                "pointer-session",
+                30.0,
+                40.0,
+                0,
+                async { Ok(Some(json!({ "items": [] }))) },
+                |drag_data| async move {
+                    assert!(drag_data.is_some());
+                    client_for_completion
+                        .send(
+                            "Input.dispatchDragEvent",
+                            json!({ "type": "drop" }),
+                            Some("pointer-session"),
+                            Duration::from_secs(1),
+                        )
+                        .await?;
+                    Ok(DragOutcome::InterceptedDrop)
+                },
+            ),
+            collect_drag_test_commands(&client, &mut write_rx, 2),
+        );
+
+        result.unwrap();
+        assert_eq!(commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(commands[0]["params"]["enabled"], false);
+        assert_eq!(commands[1]["method"], "Input.dispatchDragEvent");
+        assert_eq!(commands[1]["params"]["type"], "drop");
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn drag_without_intercepted_start_releases_mouse() {
+        let (client, mut write_rx) = new_drag_test_client();
+        let (result, commands) = tokio::join!(
+            run_drag_with_cleanup(
+                &client,
+                "root-session",
+                "pointer-session",
+                30.0,
+                40.0,
+                0,
+                async { Ok(None) },
+                |_| async { Ok(DragOutcome::NoInterceptedDrop) },
+            ),
+            collect_drag_test_commands(&client, &mut write_rx, 2),
+        );
+
+        result.unwrap();
+        assert_eq!(commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(commands[0]["params"]["enabled"], false);
+        assert_eq!(commands[1]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[1]["params"]["type"], "mouseReleased");
+        assert_eq!(commands[1]["params"]["x"], 30.0);
+        assert_eq!(commands[1]["params"]["y"], 40.0);
+        assert!(write_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn drag_completion_error_releases_mouse() {
+        let (client, mut write_rx) = new_drag_test_client();
+        let (result, commands) = tokio::join!(
+            run_drag_with_cleanup(
+                &client,
+                "root-session",
+                "pointer-session",
+                30.0,
+                40.0,
+                0,
+                async { Ok(Some(json!({ "items": [] }))) },
+                |_| async { Err(RwError::Message("completion failed".to_string())) },
+            ),
+            collect_drag_test_commands(&client, &mut write_rx, 2),
+        );
+
+        assert!(matches!(
+            result,
+            Err(RwError::Message(message)) if message == "completion failed"
+        ));
+        assert_eq!(commands[0]["method"], "Input.setInterceptDrags");
+        assert_eq!(commands[0]["params"]["enabled"], false);
+        assert_eq!(commands[1]["method"], "Input.dispatchMouseEvent");
+        assert_eq!(commands[1]["params"]["type"], "mouseReleased");
         assert!(write_rx.try_recv().is_err());
     }
 
@@ -9823,6 +9959,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::clone(&cursor_slot),
             requests: Arc::clone(&shared_requests),
             working_requests: Arc::clone(&working_requests),
+            page: None,
         };
 
         drop(lease);
@@ -9849,6 +9986,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::clone(&cursor_slot),
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
         {
             let mut live = shared_requests.lock().unwrap();
@@ -9910,6 +10048,117 @@ multiline-compatible = """4.5.6"""
 
     #[cfg(feature = "python")]
     #[test]
+    fn delivered_page_event_lease_does_not_merge_after_page_release() {
+        let harness = navigation_test_harness(4);
+        let page = Arc::clone(&harness.page);
+        let shared_requests = Arc::clone(&page.network_requests);
+        let mut working_store = NetworkRequestStore::new(2);
+        let snapshot = NetworkRequestSnapshot {
+            seq: 1,
+            request: json!({ "url": "https://example.test/late" }),
+            redirect_ancestry: Vec::new(),
+        };
+        working_store.requests.insert(
+            "request-1".to_string(),
+            NetworkRequestEntry {
+                current: snapshot.clone(),
+                applied_by_seq: BTreeMap::from([(1, snapshot)]),
+            },
+        );
+        working_store
+            .applied_order
+            .push_back((1, "request-1".to_string()));
+        let working_requests = Arc::new(Mutex::new(working_store));
+        let (_sender, receiver) = broadcast::channel(4);
+        let receiver_slot = Arc::new(Mutex::new(None));
+        let state_slot = Arc::new(Mutex::new(None));
+        let cursor_slot = Arc::new(Mutex::new(0));
+        let lease = PageEventStreamLease {
+            receiver: Some(receiver),
+            state: Some(PageEventStreamState::new()),
+            rollback_state: Some(PageEventStreamState::new()),
+            cursor: 2,
+            rollback_cursor: 0,
+            delivered: true,
+            receiver_slot,
+            state_slot,
+            cursor_slot,
+            requests: Arc::clone(&shared_requests),
+            working_requests,
+            page: Some(page.clone()),
+        };
+
+        page.release_memory_buffers();
+        drop(lease);
+
+        assert!(shared_requests.lock().unwrap().requests.is_empty());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn network_backfill_tombstone_resets_store_and_reports_overflow() {
+        fn request_event(url: &str) -> Value {
+            json!({
+                "sessionId": "page-session",
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": url,
+                    "request": {
+                        "url": url,
+                        "method": "GET",
+                        "headers": {},
+                    },
+                },
+            })
+        }
+
+        let mut event_log = CdpEventLog::new();
+        event_log.push(request_event("https://example.test/before"));
+        let mut tombstone = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "tombstone",
+                "request": {
+                    "url": "https://example.test/tombstone",
+                    "method": "POST",
+                    "headers": {"x-tombstone": "must-not-apply"},
+                },
+            },
+        });
+        tombstone
+            .as_object_mut()
+            .unwrap()
+            .insert(CDP_EVENT_UNREPLAYABLE_MARKER.to_string(), Value::Bool(true));
+        event_log.push(tombstone);
+        event_log.push(request_event("https://example.test/current"));
+        let current_event = event_log.entries_since(0)[2].1.clone();
+        let event_log = Arc::new(Mutex::new(event_log));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(0)));
+        let mut state = NetworkObservationState::new();
+
+        let result = process_network_observation_event(
+            2,
+            &current_event,
+            &event_log,
+            "page-session",
+            &requests,
+            true,
+            &mut state,
+        );
+
+        assert_eq!(result, Err(1));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.next_applied_seq, 3);
+        assert!(requests.requests.is_empty());
+        assert!(requests.applied_order.is_empty());
+        drop(requests);
+        assert!(state.pending_responses.is_empty());
+        assert!(state.response_extra_infos.is_empty());
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
     fn stale_page_event_ack_does_not_restore_requests_cleared_by_overflow() {
         fn store(url: &str, next_seq: u64) -> NetworkRequestStore {
             let mut store = NetworkRequestStore::new(next_seq);
@@ -9951,6 +10200,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot,
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(20);
@@ -10117,6 +10367,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::new(Mutex::new(7_999)),
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(8_000);
@@ -10213,6 +10464,7 @@ multiline-compatible = """4.5.6"""
             cursor_slot: Arc::new(Mutex::new(7_999)),
             requests: Arc::clone(&shared_requests),
             working_requests,
+            page: None,
         };
 
         shared_requests.lock().unwrap().reset_after_overflow(8_000);
@@ -10329,6 +10581,512 @@ multiline-compatible = """4.5.6"""
         );
         assert_eq!(batch[2]["seq"], 3);
         assert_eq!(batch[2]["kind"], "requestfinished");
+    }
+
+    #[tokio::test]
+    async fn console_capture_provisional_cutoff_blocks_ordered_pump_during_setup() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        let event_log = Arc::clone(&harness.event_log);
+        let mut events = harness.events.subscribe();
+        let (_close_tx, close_rx) = watch::channel(false);
+        let (_alive_tx, alive_rx) = watch::channel(true);
+        let mut state = PageEventStreamState::for_page(&page);
+        let mut cursor = 0;
+
+        let capture_page = Arc::clone(&page);
+        let capture = tokio::spawn(async move {
+            enable_console_capture_for_session(
+                &capture_page,
+                "child-session",
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let enable = harness.next_command("Runtime.enable").await;
+        assert_eq!(
+            event_log
+                .lock()
+                .unwrap()
+                .console_replay_cutoff("child-session"),
+            Some(u64::MAX)
+        );
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "child-session",
+                "targetInfo": {
+                    "type": "iframe",
+                    "targetId": "child-frame",
+                    "parentFrameId": "main-frame"
+                }
+            }
+        }));
+        let attach = event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .last()
+            .unwrap()
+            .1
+            .clone();
+        harness.emit(json!({
+            "sessionId": "child-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "before capture response"}]
+            }
+        }));
+        let console = event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .last()
+            .unwrap()
+            .1
+            .clone();
+        record_page_observation_event(&page, &attach);
+        record_page_observation_event(&page, &console);
+
+        let (batch, closed) = wait_for_page_event_batch(
+            &mut events,
+            Arc::clone(&event_log),
+            &mut cursor,
+            "page-session",
+            Arc::clone(&page.network_requests),
+            &mut state,
+            &page,
+            close_rx,
+            alive_rx,
+            Duration::ZERO,
+            64,
+        )
+        .await;
+        assert!(!closed);
+        assert!(
+            batch.is_empty(),
+            "the ordered pump must hide console history while Runtime.enable is pending"
+        );
+
+        page.observation_event_cursor
+            .store(cursor, Ordering::SeqCst);
+        harness.reply(&enable, json!({}));
+        assert_eq!(capture.await.unwrap().unwrap(), cursor);
+        assert_eq!(
+            event_log
+                .lock()
+                .unwrap()
+                .console_replay_cutoff("child-session"),
+            Some(cursor)
+        );
+    }
+
+    #[tokio::test]
+    async fn console_capture_failure_releases_ordered_replay_cutoff() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        let event_log = Arc::clone(&harness.event_log);
+        let mut events = harness.events.subscribe();
+        let (_close_tx, close_rx) = watch::channel(false);
+        let (_alive_tx, alive_rx) = watch::channel(true);
+        let mut state = PageEventStreamState::for_page(&page);
+        let mut cursor = 0;
+
+        let capture_page = Arc::clone(&page);
+        let capture = tokio::spawn(async move {
+            enable_console_capture_for_session(
+                &capture_page,
+                "child-session",
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let enable = harness.next_command("Runtime.enable").await;
+        assert_eq!(
+            event_log
+                .lock()
+                .unwrap()
+                .console_replay_cutoff("child-session"),
+            Some(u64::MAX)
+        );
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "child-session",
+                "targetInfo": {
+                    "type": "iframe",
+                    "targetId": "child-frame",
+                    "parentFrameId": "main-frame"
+                }
+            }
+        }));
+        harness.reply_error(&enable, "capture setup failed");
+        assert!(capture.await.unwrap().is_err());
+        let canceled_cutoff = event_log
+            .lock()
+            .unwrap()
+            .console_replay_cutoff("child-session")
+            .expect("failed capture must retain a finite cancellation cutoff");
+        assert_ne!(canceled_cutoff, u64::MAX);
+
+        harness.emit(json!({
+            "sessionId": "child-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "after failed capture"}]
+            }
+        }));
+        let (batch, closed) = wait_for_page_event_batch(
+            &mut events,
+            Arc::clone(&event_log),
+            &mut cursor,
+            "page-session",
+            Arc::clone(&page.network_requests),
+            &mut state,
+            &page,
+            close_rx,
+            alive_rx,
+            Duration::ZERO,
+            64,
+        )
+        .await;
+        assert!(!closed);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0]["kind"], "console");
+        assert_eq!(batch[0]["payload"]["text"], "after failed capture");
+    }
+
+    #[tokio::test]
+    async fn release_memory_buffers_clears_console_capture_after_setup_settles() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        page.console_capture.requested.store(true, Ordering::SeqCst);
+        let capture_page = Arc::clone(&page);
+        let capture = tokio::spawn(async move {
+            enable_console_capture_for_session(
+                &capture_page,
+                "page-session",
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let enable = harness.next_command("Runtime.enable").await;
+        page.release_memory_buffers();
+        harness.reply(&enable, json!({}));
+
+        assert!(matches!(
+            capture.await.unwrap(),
+            Err(RwError::TargetClosed(TargetClosedKind::Page))
+        ));
+        assert!(!page.console_capture.requested.load(Ordering::SeqCst));
+        let enabled_sessions = page.console_capture.enabled_sessions.lock().await;
+        assert!(enabled_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_resume_claim_and_failure_use_production_watchdog_path() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        let event_log = Arc::clone(&harness.event_log);
+        page.frame_state
+            .lock()
+            .unwrap()
+            .set_worker_event_interest(true);
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "worker-session",
+                "targetInfo": {
+                    "type": "worker",
+                    "targetId": "worker-target"
+                }
+            }
+        }));
+        let attached = event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .last()
+            .unwrap()
+            .1
+            .clone();
+        handle_page_oopif_event(Arc::clone(&page), attached.clone()).await;
+        assert!(page
+            .frame_state
+            .lock()
+            .unwrap()
+            .worker_resume_handoff_pending("worker-session"));
+        assert_eq!(
+            page_worker_session_from_attachment(&page, &attached),
+            Some("worker-session".to_string())
+        );
+        let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+
+        let first_resume_page = Arc::clone(&page);
+        let first_resume = tokio::spawn(async move {
+            resume_worker_after_claim(&first_resume_page, "worker-session", Duration::from_secs(1))
+                .await
+        });
+        let first_command = harness
+            .next_command("Runtime.runIfWaitingForDebugger")
+            .await;
+        harness.reply_error(&first_command, "transient resume failure");
+        assert!(first_resume.await.unwrap().is_err());
+        assert!(page
+            .frame_state
+            .lock()
+            .unwrap()
+            .worker_resume_handoff_pending("worker-session"));
+
+        let mut watchdog = Box::pin(worker_resume_watchdog_step(
+            &page,
+            "worker-session",
+            &mut updates,
+            Duration::ZERO,
+        ));
+        let retry_command = tokio::select! {
+            command = harness.next_command("Runtime.runIfWaitingForDebugger") => command,
+            result = &mut watchdog => panic!("watchdog completed without a resume command: {result}"),
+        };
+        harness.reply(&retry_command, json!({}));
+        assert!(watchdog.await);
+        assert!(!page
+            .frame_state
+            .lock()
+            .unwrap()
+            .worker_resume_handoff_pending("worker-session"));
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "worker-session-claimed",
+                "targetInfo": {
+                    "type": "worker",
+                    "targetId": "worker-target-claimed"
+                }
+            }
+        }));
+        let second_attached = event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .last()
+            .unwrap()
+            .1
+            .clone();
+        handle_page_oopif_event(Arc::clone(&page), second_attached.clone()).await;
+        assert_eq!(
+            page_worker_session_from_attachment(&page, &second_attached),
+            Some("worker-session-claimed".to_string())
+        );
+        let mut claimed_updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+        assert!(
+            worker_resume_watchdog_step(
+                &page,
+                "worker-session-claimed",
+                &mut claimed_updates,
+                Duration::ZERO,
+            )
+            .await
+        );
+        assert!(
+            harness.try_next_command_any().is_none(),
+            "the watchdog must not steal a claimed consumer handoff"
+        );
+        let second_resume_page = Arc::clone(&page);
+        let second_resume = tokio::spawn(async move {
+            resume_worker_after_claim(
+                &second_resume_page,
+                "worker-session-claimed",
+                Duration::from_secs(1),
+            )
+            .await
+        });
+        let second_command = harness
+            .next_command("Runtime.runIfWaitingForDebugger")
+            .await;
+        harness.reply(&second_command, json!({}));
+        assert!(second_resume.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_resume_watchdog_stops_after_page_close_cleanup() {
+        let mut harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        {
+            let mut state = page.frame_state.lock().unwrap();
+            state.set_worker_event_interest(true);
+        }
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "worker-session",
+                "targetInfo": {
+                    "type": "worker",
+                    "targetId": "worker-target"
+                }
+            }
+        }));
+        let attached = harness
+            .event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .last()
+            .unwrap()
+            .1
+            .clone();
+        handle_page_oopif_event(Arc::clone(&page), attached).await;
+        assert!(page
+            .frame_state
+            .lock()
+            .unwrap()
+            .worker_resume_handoff_pending("worker-session"));
+
+        page.target_closed.store(true, Ordering::SeqCst);
+        page.close_in_background();
+        assert!(!page
+            .frame_state
+            .lock()
+            .unwrap()
+            .worker_resume_handoff_pending("worker-session"));
+        let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+        assert!(
+            !worker_resume_watchdog_step(&page, "worker-session", &mut updates, Duration::ZERO,)
+                .await
+        );
+        assert!(harness.try_next_command_any().is_none());
+    }
+
+    #[tokio::test]
+    async fn native_waiter_snapshot_survives_oopif_console_before_detach_during_setup() {
+        let harness = navigation_test_harness(16);
+        let page = Arc::clone(&harness.page);
+        let event_log = Arc::clone(&harness.event_log);
+        warm_main_frame_cache(&page);
+        let (lifecycle_events, lifecycle_cursor) = page.browser.client.subscribe_with_cursor();
+        start_page_frame_cache_tracking_with_subscription(
+            &page,
+            lifecycle_events,
+            lifecycle_cursor,
+            "page-session",
+        );
+        let (mut entered, mut completed, released) =
+            install_page_lifecycle_test_barrier(&page, "child-session");
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "child-session",
+                "targetInfo": {
+                    "type": "iframe",
+                    "parentFrameId": "main-frame"
+                }
+            }
+        }));
+        tokio::time::timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("lifecycle consumer must reach the setup barrier")
+            .expect("lifecycle barrier sender must remain connected");
+        assert!(*entered.borrow());
+        assert_eq!(event_log.lock().unwrap().cursor(), 1);
+        assert!(
+            !page
+                .frame_state
+                .lock()
+                .unwrap()
+                .owns_session("child-session"),
+            "the lifecycle consumer must still be paused at the barrier"
+        );
+
+        let child_cursor = event_log.lock().unwrap().cursor();
+        let (mut events, mut cursor, mut state) =
+            PageEventStreamState::subscribe_page_event_stream(&page);
+        assert_eq!(cursor, child_cursor);
+        assert!(state.owns_session("child-session"));
+
+        released.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), completed.changed())
+            .await
+            .expect("lifecycle consumer must leave the setup barrier")
+            .expect("lifecycle completion sender must remain connected");
+        let lifecycle_tail = harness.event_log.lock().unwrap().cursor();
+        harness.emit(json!({
+            "method": "Test.lifecycle-barrier-released",
+            "params": {}
+        }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if page.observation_event_cursor.load(Ordering::SeqCst) >= lifecycle_tail + 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle consumer must finish the barrier event");
+
+        harness.emit(json!({
+            "sessionId": "child-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "last"}]
+            }
+        }));
+        harness.emit(json!({
+            "method": "Target.detachedFromTarget",
+            "params": {"sessionId": "child-session"}
+        }));
+
+        let (_close_tx, close_rx) = watch::channel(false);
+        let (_alive_tx, alive_rx) = watch::channel(true);
+        let (batch, closed) = wait_for_page_event_batch(
+            &mut events,
+            Arc::clone(&event_log),
+            &mut cursor,
+            "page-session",
+            Arc::clone(&page.network_requests),
+            &mut state,
+            &page,
+            close_rx,
+            alive_rx,
+            Duration::ZERO,
+            1,
+        )
+        .await;
+        assert!(!closed);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0]["kind"], "console");
+        assert_eq!(batch[0]["payload"]["text"], "last");
+        let (_close_tx, close_rx) = watch::channel(false);
+        let (_alive_tx, alive_rx) = watch::channel(true);
+        let (tail, tail_closed) = wait_for_page_event_batch(
+            &mut events,
+            Arc::clone(&event_log),
+            &mut cursor,
+            "page-session",
+            Arc::clone(&page.network_requests),
+            &mut state,
+            &page,
+            close_rx,
+            alive_rx,
+            Duration::ZERO,
+            64,
+        )
+        .await;
+        assert!(!tail_closed);
+        assert!(tail.is_empty());
+        assert!(!state.owns_session("child-session"));
     }
 
     #[test]
@@ -12905,6 +13663,103 @@ return this.dataset.mainWorldOverride === "observed";
         assert!(
             harness.write_rx.try_recv().is_err(),
             "stale attachment must not send recovery setup commands"
+        );
+    }
+    #[tokio::test]
+    async fn worker_session_sequence_gate_rejects_stale_attachment_and_clears_capture_state() {
+        let harness = navigation_test_harness(8);
+        let worker_session = "worker-session";
+        let attach = json!({
+            "__rustwright_cdp_event_seq": 10,
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": worker_session,
+                "targetInfo": {"type": "worker"}
+            }
+        });
+        handle_page_oopif_event(Arc::clone(&harness.page), attach.clone()).await;
+        harness
+            .page
+            .console_capture
+            .enabled_sessions
+            .lock()
+            .await
+            .insert(worker_session.to_string());
+        harness
+            .page
+            .console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .insert(worker_session.to_string(), 11);
+
+        handle_page_oopif_event(
+            Arc::clone(&harness.page),
+            json!({
+                "__rustwright_cdp_event_seq": 20,
+                "sessionId": "page-session",
+                "method": "Target.detachedFromTarget",
+                "params": {"sessionId": worker_session}
+            }),
+        )
+        .await;
+        handle_page_oopif_event(Arc::clone(&harness.page), attach).await;
+
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(!state.owns_worker_session(worker_session));
+        drop(state);
+        assert!(!harness
+            .page
+            .console_capture
+            .enabled_sessions
+            .lock()
+            .await
+            .contains(worker_session));
+        assert!(!harness
+            .page
+            .console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .contains_key(worker_session));
+    }
+
+    #[tokio::test]
+    async fn console_capture_multi_session_setup_uses_remaining_deadline() {
+        let mut harness = navigation_test_harness(8);
+        {
+            let mut state = harness.page.frame_state.lock().unwrap();
+            state.record_session_for_frame("iframe-frame", "iframe-session");
+            state
+                .iframe_sessions_ready
+                .insert("iframe-session".to_string());
+        }
+        let page = Arc::clone(&harness.page);
+        let operation =
+            async move { enable_console_capture(&page, Duration::from_millis(100)).await };
+        let responder = async {
+            let first = harness.next_command("Runtime.enable").await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            harness.reply(&first, json!({}));
+            let second = harness.next_command("Runtime.enable").await;
+            (first["sessionId"].clone(), second["sessionId"].clone())
+        };
+        let started = Instant::now();
+        let (result, (first_session, second_session)) =
+            tokio::time::timeout(Duration::from_millis(135), async {
+                tokio::join!(operation, responder)
+            })
+            .await
+            .expect("second session setup must consume the remaining budget");
+
+        assert!(
+            matches!(result, Err(RwError::Timeout(ms)) if ms > 0 && ms < 100),
+            "second setup must report only its remaining timeout: {result:?}"
+        );
+        assert_ne!(first_session, second_session);
+        assert!(
+            started.elapsed() < Duration::from_millis(135),
+            "second setup exceeded the original deadline: {:?}",
+            started.elapsed()
         );
     }
 
@@ -15788,6 +16643,128 @@ return this.dataset.mainWorldOverride === "observed";
 
         harness.reply_error(&focus, "setup deliberately withheld");
         harness.reply_error(&file_chooser, "setup deliberately withheld");
+    }
+
+    #[tokio::test]
+    async fn manual_oopif_attachment_does_not_repopulate_released_page() {
+        let mut harness = navigation_test_harness(8);
+        let page = Arc::clone(&harness.page);
+        let target_info = json!({
+            "type": "iframe",
+            "targetId": "released-child-frame",
+            "parentFrameId": "root-frame",
+        });
+        let resolver_page = Arc::clone(&page);
+        let resolver = tokio::spawn(async move {
+            attach_iframe_target_for_frame(
+                resolver_page,
+                "released-child-frame",
+                &target_info,
+                "page-session",
+                OperationDeadline::new(Duration::from_secs(2)),
+            )
+            .await
+        });
+
+        let attach = harness.next_command("Target.attachToTarget").await;
+        page.release_memory_buffers();
+        harness.reply(&attach, json!({ "sessionId": "released-child-session" }));
+
+        let detach = harness.next_command("Target.detachFromTarget").await;
+        assert_eq!(
+            detach["params"],
+            json!({ "sessionId": "released-child-session" })
+        );
+        let result = resolver.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(RwError::TargetClosed(TargetClosedKind::Page))
+        ));
+        let state = harness.page.frame_state.lock().unwrap();
+        assert!(state.frames.is_empty());
+        assert!(state.frame_sessions.is_empty());
+        assert!(state.session_frames.is_empty());
+        assert!(state.frame_session_waiters.is_empty());
+    }
+
+    #[test]
+    fn page_event_tombstone_rebuilds_child_session_ownership() {
+        let harness = navigation_test_harness(8);
+        {
+            let mut frame_state = harness.page.frame_state.lock().unwrap();
+            frame_state.record_frame(
+                "main-frame".to_string(),
+                None,
+                None,
+                Some("https://example.test/".to_string()),
+                "page-session".to_string(),
+            );
+            frame_state.record_session_for_frame("child-frame", "child-session");
+            frame_state.record_frame(
+                "child-frame".to_string(),
+                Some("main-frame".to_string()),
+                None,
+                Some("https://child.example.test/".to_string()),
+                "child-session".to_string(),
+            );
+        }
+        let oversized_attachment = json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "child-session",
+                "waitingForDebugger": vec!["x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES); 16],
+                "targetInfo": {
+                    "type": "iframe",
+                    "targetId": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "subtype": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "title": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "url": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "openerId": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                    "parentFrameId": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES),
+                },
+            },
+        });
+        let (tombstone, _) = compact_retained_cdp_event(oversized_attachment);
+        assert!(is_unreplayable_cdp_event(&tombstone));
+        let mut stream_state = PageEventStreamState::for_session("page-session".to_string());
+        stream_state
+            .owned_sessions
+            .insert("stale-session".to_string());
+        let console = json!({
+            "sessionId": "child-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{"type": "string", "value": "after overflow"}],
+            },
+        });
+
+        process_page_observation_event_with_page(
+            0,
+            &tombstone,
+            &harness.event_log,
+            "page-session",
+            &harness.page.network_requests,
+            &mut stream_state,
+            Some(&harness.page),
+        );
+        assert!(stream_state.owned_sessions.contains("child-session"));
+        assert!(!stream_state.owned_sessions.contains("stale-session"));
+        process_page_observation_event_with_page(
+            1,
+            &console,
+            &harness.event_log,
+            "page-session",
+            &harness.page.network_requests,
+            &mut stream_state,
+            Some(&harness.page),
+        );
+        let mut batch = Vec::new();
+        append_ready_page_events(&mut batch, &mut stream_state, 8);
+        assert_eq!(batch[0]["kind"], "_overflow");
+        assert_eq!(batch[1]["kind"], "console");
+        assert_eq!(batch[1]["payload"]["text"], "after overflow");
     }
 
     #[tokio::test]
@@ -21945,6 +22922,295 @@ return this.dataset.mainWorldOverride === "observed";
             .action_dispatch_receipts
             .is_empty());
     }
+    #[test]
+    fn cdp_event_log_bounds_retained_payloads_without_changing_live_events() {
+        let mut log = CdpEventLog::new();
+        let event = json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [{ "value": "x".repeat(CDP_EVENT_LOG_MAX_ENTRY_BYTES * 2) }]
+            }
+        });
+        let live = log.push(event.clone());
+        assert_eq!(
+            live.pointer("/params/args/0/value")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(CDP_EVENT_LOG_MAX_ENTRY_BYTES * 2)
+        );
+        let retained = log.entries_since(0);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0, 0);
+        assert!(retained[0]
+            .1
+            .pointer("/params/args/0/value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.len() <= CDP_RETAINED_STRING_MAX_BYTES));
+        assert!(log.retained_bytes <= CDP_EVENT_LOG_MAX_BYTES);
+        assert_eq!(log.cursor_after_event(0, &live), 1);
+    }
+    #[test]
+    fn cdp_event_log_tombstones_payloads_that_remain_oversized_after_compaction() {
+        let mut log = CdpEventLog::new();
+        let event = json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": (0..9)
+                    .map(|index| json!({ "type": "string", "value": format!("{index}:{}", "x".repeat(8_193)) }))
+                    .collect::<Vec<_>>()
+            }
+        });
+
+        let live = log.push(event);
+        let retained = log.entries_since(0);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].0, 0);
+        assert_eq!(live["method"], "Runtime.consoleAPICalled");
+        assert_eq!(retained[0].1["method"], "Runtime.consoleAPICalled");
+        assert_eq!(retained[0].1["sessionId"], "page-session");
+        assert_eq!(retained[0].1["__rustwright_cdp_event_seq"], 0);
+        assert_eq!(
+            retained[0].1[CDP_EVENT_UNREPLAYABLE_MARKER],
+            Value::Bool(true)
+        );
+        assert!(retained[0].1.pointer("/params/args").is_none());
+        assert!(retained_cdp_event_size(&retained[0].1) <= CDP_EVENT_LOG_MAX_ENTRY_BYTES);
+    }
+
+    #[test]
+    fn page_event_stream_turns_compacted_tombstone_into_explicit_overflow() {
+        let mut log = CdpEventLog::new();
+        let event = json!({
+            "sessionId": "page-session",
+            "method": "Network.requestWillBeSent",
+            "params": {
+                "requestId": "request-1",
+                "request": {
+                    "url": "https://example.test/large",
+                    "method": "GET",
+                    "headers": (0..9)
+                        .map(|index| format!("{index}:{}", "x".repeat(8_193)))
+                        .collect::<Vec<_>>()
+                }
+            }
+        });
+        log.push(event);
+        let retained = log.entries_since(0).remove(0).1;
+        let event_log = Arc::new(Mutex::new(log));
+        let requests = Arc::new(Mutex::new(NetworkRequestStore::new(0)));
+        let mut state = PageEventStreamState::new();
+
+        process_page_observation_event(
+            0,
+            &retained,
+            &event_log,
+            "page-session",
+            &requests,
+            &mut state,
+        );
+
+        assert_eq!(state.ready.get(&0).unwrap()["kind"], "_overflow");
+        assert_eq!(
+            state.ready.get(&0).unwrap()["payload"]["reason"],
+            "unreplayable_event"
+        );
+        assert_eq!(requests.lock().unwrap().next_applied_seq, 1);
+    }
+
+    #[test]
+    fn cdp_event_log_byte_horizon_uses_stored_entry_sizes() {
+        let mut log = CdpEventLog::new();
+        for index in 0..CDP_EVENT_LOG_LIMIT {
+            log.push(json!({
+                "method": "Test.byteHorizon",
+                "params": { "index": index, "payload": "x".repeat(4_096) }
+            }));
+        }
+
+        assert!(log.events.len() < CDP_EVENT_LOG_LIMIT);
+        assert!(log.oldest_seq() > 0);
+        assert!(log.retained_bytes <= CDP_EVENT_LOG_MAX_BYTES);
+        assert_eq!(
+            log.retained_bytes,
+            log.events
+                .iter()
+                .map(|entry| entry.retained_bytes)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn terminal_event_log_release_shrinks_backing_storage() {
+        let mut log = CdpEventLog::new();
+        log.push(json!({ "method": "Test.retained", "params": { "value": "x" } }));
+        assert!(log.events.capacity() > 0);
+        log.clear_retained();
+        assert!(log.events.is_empty());
+        assert_eq!(log.events.capacity(), 0);
+        assert_eq!(log.retained_bytes, 0);
+    }
+
+    #[test]
+    fn late_dispatch_after_terminal_release_cannot_resurrect_retained_state() {
+        let harness = navigation_test_harness(4);
+        let client = Arc::clone(&harness.page.browser.client);
+        client.release_memory_buffers();
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Runtime.consoleAPICalled",
+            "params": { "type": "log", "args": [{ "value": "late" }] }
+        }));
+
+        assert!(harness.event_log.lock().unwrap().events.is_empty());
+        assert!(harness
+            .page
+            .browser
+            .client
+            .traffic_log
+            .lock()
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(harness
+            .page
+            .browser
+            .client
+            .runtime_state
+            .lock()
+            .unwrap()
+            .serializers
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_flight_page_event_after_terminal_release_cannot_resurrect_page_state() {
+        let harness = navigation_test_harness(4);
+        let page = Arc::clone(&harness.page);
+        harness.listen_for_oopif_events();
+        let (mut entered, mut completed, released) =
+            install_page_lifecycle_test_barrier(&page, "child-session");
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "child-session",
+                "targetInfo": {
+                    "type": "iframe",
+                    "targetId": "child-frame",
+                    "parentFrameId": "main-frame",
+                },
+            },
+        }));
+        tokio::time::timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("page event handler must reach the lifecycle barrier")
+            .expect("lifecycle barrier sender must remain connected");
+
+        page.release_memory_buffers();
+        page.browser.client.release_memory_buffers();
+        released.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), completed.changed())
+            .await
+            .expect("page event handler must leave the lifecycle barrier")
+            .expect("lifecycle completion sender must remain connected");
+
+        assert!(!page
+            .frame_state
+            .lock()
+            .unwrap()
+            .owns_session("child-session"));
+        assert!(page
+            .browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .events
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn console_worker_waiter_drops_attachment_after_terminal_release() {
+        let harness = navigation_test_harness(4);
+        let page = Arc::clone(&harness.page);
+        let event_log = Arc::clone(&harness.event_log);
+        let (mut entered, mut completed, released) =
+            install_page_lifecycle_test_barrier(&page, "worker-session");
+
+        harness.emit(json!({
+            "sessionId": "page-session",
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "worker-session",
+                "targetInfo": {
+                    "type": "worker",
+                    "targetId": "worker-target",
+                },
+            },
+        }));
+        let event = event_log
+            .lock()
+            .unwrap()
+            .entries_since(0)
+            .last()
+            .expect("worker attachment event")
+            .1
+            .clone();
+        let waiter_page = Arc::clone(&page);
+        let waiter_log = Arc::clone(&event_log);
+        let waiter = tokio::spawn(async move {
+            let mut cursor = 0;
+            let replay_until = HashMap::new();
+            process_console_wait_event(
+                event,
+                &mut cursor,
+                0,
+                &waiter_log,
+                "page-session",
+                &replay_until,
+                "console",
+                Some(waiter_page),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.changed())
+            .await
+            .expect("console waiter must reach the lifecycle barrier")
+            .expect("lifecycle barrier sender must remain connected");
+
+        page.release_memory_buffers();
+        released.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), completed.changed())
+            .await
+            .expect("console waiter must leave the lifecycle barrier")
+            .expect("lifecycle barrier sender must remain connected");
+        assert_eq!(waiter.await.unwrap().unwrap(), None);
+        assert!(!page
+            .frame_state
+            .lock()
+            .unwrap()
+            .owns_session("worker-session"));
+        assert_eq!(
+            remove_page_worker_session_from_detachment(
+                &page,
+                &json!({
+                    "method": "Target.detachedFromTarget",
+                    "params": {"sessionId": "worker-session"},
+                }),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn commencing_receipt_is_terminal_only_for_single_evaluation_dispatch() {
@@ -22194,6 +23460,200 @@ return this.dataset.mainWorldOverride === "observed";
                 && error.contains("binding registration rejected"),
             "unexpected binding failure: {error}"
         );
+    }
+
+    #[test]
+    fn goto_timeout_reports_configured_budget_after_suboperation_timeout() {
+        let deadline = OperationDeadline::new(Duration::from_millis(50));
+        assert!(matches!(
+            normalize_navigation_timeout(RwError::Timeout(49), deadline),
+            RwError::Timeout(50)
+        ));
+    }
+
+    #[tokio::test]
+    async fn observed_goto_timeout_reports_configured_budget_after_suboperation_timeout() {
+        let mut harness = navigation_test_harness(4);
+        let timeout = Duration::from_millis(150);
+        let navigation = page_goto_observed_async(
+            Arc::clone(&harness.page),
+            "https://example.test/observed-timeout".to_owned(),
+            "load".to_owned(),
+            timeout,
+            None,
+        );
+        let responder = async move {
+            let navigate = harness.next_command("Page.navigate").await;
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            harness.reply(
+                &navigate,
+                json!({ "frameId": "frame-1", "loaderId": "loader-1" }),
+            );
+            harness.next_command("Runtime.evaluate").await;
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("observed goto timeout should remain bounded");
+        assert!(
+            matches!(result, Err(RwError::Timeout(150))),
+            "observed goto timeout: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_timeout_reports_configured_budget_after_suboperation_timeout() {
+        let mut harness = navigation_test_harness(4);
+        let timeout = Duration::from_millis(150);
+        let navigation = page_reload_observed_async(
+            Arc::clone(&harness.page),
+            Arc::clone(&harness.page.browser.client),
+            "page-session".to_owned(),
+            "load".to_owned(),
+            timeout,
+        );
+        let responder = async move {
+            harness
+                .reply_next(
+                    "Page.getFrameTree",
+                    json!({
+                        "frameTree": {
+                            "frame": {
+                                "id": "frame-main",
+                                "url": "https://example.test/reload-timeout"
+                            }
+                        }
+                    }),
+                )
+                .await;
+            let reload = harness.next_command("Page.reload").await;
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            harness.reply(&reload, json!({}));
+            harness.next_command("Runtime.evaluate").await;
+        };
+
+        let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+            tokio::join!(navigation, responder)
+        })
+        .await
+        .expect("reload timeout should remain bounded");
+        assert!(
+            matches!(result, Err(RwError::Timeout(150))),
+            "reload timeout: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_navigation_timeouts_report_configured_budget_after_suboperation_timeout() {
+        for offset in [-1, 1] {
+            let mut harness = navigation_test_harness(4);
+            let timeout = Duration::from_millis(150);
+            let navigation = page_history_observed_async(
+                Arc::clone(&harness.page),
+                Arc::clone(&harness.page.browser.client),
+                "page-session".to_owned(),
+                offset,
+                "commit".to_owned(),
+                timeout,
+            );
+            let responder = async move {
+                let history = harness.next_command("Page.getNavigationHistory").await;
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                harness.reply(
+                    &history,
+                    json!({
+                        "currentIndex": if offset < 0 { 1 } else { 0 },
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/history-a" },
+                            { "id": 2, "url": "https://example.test/history-b" }
+                        ]
+                    }),
+                );
+                harness
+                    .reply_next(
+                        "Page.getFrameTree",
+                        json!({
+                            "frameTree": {
+                                "frame": {
+                                    "id": "frame-main",
+                                    "url": "https://example.test/history-current"
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                harness.next_command("Page.navigateToHistoryEntry").await;
+            };
+
+            let (result, ()) = tokio::time::timeout(Duration::from_millis(300), async {
+                tokio::join!(navigation, responder)
+            })
+            .await
+            .expect("history timeout should remain bounded");
+            assert!(
+                matches!(result, Err(RwError::Timeout(150))),
+                "history offset {offset} timeout: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_navigation_timeouts_report_configured_budget_after_suboperation_timeout() {
+        let timeout = Duration::from_millis(150);
+
+        let mut reload_harness = navigation_test_harness(4);
+        let reload_page = RustwrightPage {
+            inner: Arc::clone(&reload_harness.page),
+        };
+        let reload_handle = reload_harness.page.browser.runtime.handle().clone();
+        reload_handle.spawn(async move {
+            let reload = reload_harness.next_command("Page.reload").await;
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            reload_harness.reply(&reload, json!({}));
+        });
+        let reload_result = reload_page.reload(Some("load"), timeout);
+        assert!(
+            matches!(reload_result, Err(RwError::Timeout(150))),
+            "reload timeout: {reload_result:?}"
+        );
+
+        for offset in [-1_i64, 1] {
+            let mut history_harness = navigation_test_harness(4);
+            let history_page = RustwrightPage {
+                inner: Arc::clone(&history_harness.page),
+            };
+            let history_handle = history_harness.page.browser.runtime.handle().clone();
+            history_handle.spawn(async move {
+                let history = history_harness
+                    .next_command("Page.getNavigationHistory")
+                    .await;
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                history_harness.reply(
+                    &history,
+                    json!({
+                        "currentIndex": if offset < 0 { 1 } else { 0 },
+                        "entries": [
+                            { "id": 1, "url": "https://example.test/history-a" },
+                            { "id": 2, "url": "https://example.test/history-b" }
+                        ]
+                    }),
+                );
+                history_harness
+                    .next_command("Page.navigateToHistoryEntry")
+                    .await;
+            });
+            let result = if offset < 0 {
+                history_page.go_back(Some("commit"), timeout)
+            } else {
+                history_page.go_forward(Some("commit"), timeout)
+            };
+            assert!(
+                matches!(result, Err(RwError::Timeout(150))),
+                "history offset {offset} timeout: {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -22479,7 +23939,13 @@ return this.dataset.mainWorldOverride === "observed";
         let mut log = CdpEventLog {
             next_seq: 10,
             events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
+            retained_bytes: 0,
+            retention_gate: Arc::new(CdpRetentionGate::new()),
             action_dispatch_receipts: HashMap::new(),
+            console_replay_cutoffs: HashMap::new(),
+            console_replay_cutoff_generations: HashMap::new(),
+            console_replay_cutoff_cancellations: HashMap::new(),
+            next_console_replay_cutoff_generation: 0,
         };
         let initial = json!({
             "sessionId": "page-session",
@@ -22723,6 +24189,16 @@ return this.dataset.mainWorldOverride === "observed";
         .unwrap_err();
 
         assert!(error.to_string().contains("duplicate field"));
+    }
+
+    #[cfg(feature = "python")]
+    #[test]
+    fn python_launch_option_parse_errors_remain_value_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = parse_python_launch_options("{").unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+        });
     }
     #[test]
     fn remote_discovery_url_derivation_preserves_query_and_removes_known_suffix() {
@@ -23049,6 +24525,14 @@ struct LaunchOptions {
     chromium_sandbox: bool,
     #[serde(default)]
     proxy: Option<ProxyOptions>,
+}
+
+fn parse_launch_options(json: &str) -> RwResult<LaunchOptions> {
+    serde_json::from_str(json).map_err(RwError::from)
+}
+#[cfg(feature = "python")]
+fn parse_python_launch_options(json: &str) -> PyResult<LaunchOptions> {
+    parse_launch_options(json).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -23393,6 +24877,10 @@ impl CdpTrafficLog {
 
     fn snapshot(&self) -> Vec<CdpTrafficEntry> {
         self.entries.iter().cloned().collect()
+    }
+    fn clear_for_close(&mut self) {
+        self.entries = VecDeque::new();
+        self.last_page_navigate = HashMap::new();
     }
 
     fn page_navigate_waiting_for(
@@ -23755,6 +25243,14 @@ impl CdpRuntimeState {
         self.frame_loaders
             .retain(|(loader_session_id, _), _| loader_session_id != session_id);
     }
+    fn clear_for_close(&mut self) {
+        self.serializers = HashMap::new();
+        self.serializer_install_locks = HashMap::new();
+        self.serializer_generations = HashMap::new();
+        self.execution_realms = HashMap::new();
+        self.session_realms = HashMap::new();
+        self.frame_loaders = HashMap::new();
+    }
 }
 
 fn spawn_serializer_release_pump(
@@ -23984,10 +25480,292 @@ fn wrap_cdp_command_error(method: &str, error: RwError) -> RwError {
     }
 }
 
+fn merge_console_replay_cutoff(stored: &mut u64, cutoff: u64) {
+    if *stored == u64::MAX && cutoff != u64::MAX {
+        // A finite response cursor finalizes an in-flight provisional sentinel. Do not let
+        // overflow-recreated state retain the sentinel forever.
+        *stored = cutoff;
+    } else if cutoff == u64::MAX {
+        // A new capture generation must suppress replay immediately, even if an older finite
+        // cutoff is still retained for a slow ordered consumer.
+        *stored = u64::MAX;
+    } else {
+        *stored = (*stored).max(cutoff);
+    }
+}
+
+fn compact_retained_cdp_value(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if text.len() > CDP_RETAINED_STRING_MAX_BYTES {
+                let mut end = CDP_RETAINED_STRING_MAX_BYTES;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+            }
+        }
+        Value::Array(values) => {
+            values.truncate(CDP_RETAINED_ARRAY_MAX_ITEMS);
+            for value in values {
+                compact_retained_cdp_value(value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                compact_retained_cdp_value(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn retained_cdp_event_size(event: &Value) -> usize {
+    let mut writer = CountingWriter { bytes: 0 };
+    serde_json::to_writer(&mut writer, event).map_or(usize::MAX, |_| writer.bytes)
+}
+
+fn retained_object_fields(value: &Value, fields: &[&str]) -> Value {
+    let mut retained = serde_json::Map::new();
+    if let Some(object) = value.as_object() {
+        for field in fields {
+            if let Some(value) = object.get(*field) {
+                retained.insert((*field).to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(retained)
+}
+
+fn retained_cdp_event_params(method: &str, params: &Value) -> Option<Value> {
+    let mut retained = serde_json::Map::new();
+    let fields: &[&str] = match method {
+        "Page.frameAttached" => &["frameId", "parentFrameId"],
+        "Page.frameDetached" => &["frameId", "reason"],
+        "Page.navigatedWithinDocument" => &["frameId", "url", "navigationType"],
+        "Page.frameNavigated" => &["frame"],
+        "Target.attachedToTarget" => &["sessionId", "targetInfo", "waitingForDebugger"],
+        "Target.detachedFromTarget" => &["sessionId", "targetId"],
+        "Runtime.executionContextCreated" => &["context"],
+        "Runtime.executionContextDestroyed" => &["executionContextId", "executionContextUniqueId"],
+        "Network.requestWillBeSent" => &[
+            "requestId",
+            "loaderId",
+            "documentURL",
+            "type",
+            "frameId",
+            "hasUserGesture",
+            "redirectHasExtraInfo",
+        ],
+        "Network.requestWillBeSentExtraInfo" => &["requestId"],
+        "Network.responseReceived" => &["requestId", "loaderId", "type", "frameId", "hasExtraInfo"],
+        "Network.responseReceivedExtraInfo" => {
+            &["requestId", "statusCode", "resourceIPAddressSpace"]
+        }
+        "Network.loadingFinished" | "Network.loadingFailed" => &[
+            "requestId",
+            "encodedDataLength",
+            "errorText",
+            "blockedReason",
+            "canceled",
+        ],
+        "Runtime.consoleAPICalled" => &[
+            "type",
+            "executionContextId",
+            "timestamp",
+            "exceptionId",
+            "stackTrace",
+        ],
+        "Runtime.exceptionThrown" => &["timestamp", "exceptionDetails"],
+        _ => &[],
+    };
+    if let Some(object) = params.as_object() {
+        for field in fields {
+            if let Some(value) = object.get(*field) {
+                let value = match (*field, method) {
+                    ("frame", "Page.frameNavigated") => retained_object_fields(
+                        value,
+                        &[
+                            "id",
+                            "parentId",
+                            "loaderId",
+                            "url",
+                            "name",
+                            "securityOrigin",
+                            "mimeType",
+                            "unreachableUrl",
+                            "adFrameType",
+                        ],
+                    ),
+                    ("targetInfo", "Target.attachedToTarget") => retained_object_fields(
+                        value,
+                        &[
+                            "targetId",
+                            "type",
+                            "subtype",
+                            "title",
+                            "url",
+                            "openerId",
+                            "parentFrameId",
+                        ],
+                    ),
+                    ("context", "Runtime.executionContextCreated") => {
+                        let mut context = retained_object_fields(
+                            value,
+                            &["id", "uniqueId", "name", "origin", "auxData"],
+                        );
+                        if let Some(aux_data) = value.get("auxData") {
+                            if let Some(object) = context.as_object_mut() {
+                                object.insert(
+                                    "auxData".to_string(),
+                                    retained_object_fields(
+                                        aux_data,
+                                        &["frameId", "isDefault", "type"],
+                                    ),
+                                );
+                            }
+                        }
+                        context
+                    }
+                    _ => value.clone(),
+                };
+                retained.insert((*field).to_string(), value);
+            }
+        }
+        if method == "Network.requestWillBeSent" {
+            if let Some(request) = object.get("request") {
+                retained.insert(
+                    "request".to_string(),
+                    retained_object_fields(
+                        request,
+                        &["url", "method", "initialPriority", "referrerPolicy"],
+                    ),
+                );
+            }
+        } else if method == "Network.responseReceived" {
+            if let Some(response) = object.get("response") {
+                retained.insert(
+                    "response".to_string(),
+                    retained_object_fields(
+                        response,
+                        &[
+                            "url",
+                            "status",
+                            "statusText",
+                            "mimeType",
+                            "protocol",
+                            "securityState",
+                            "encodedDataLength",
+                        ],
+                    ),
+                );
+            }
+        }
+    }
+    (!retained.is_empty()).then_some(Value::Object(retained))
+}
+
+fn compact_retained_cdp_event(mut event: Value) -> (Value, usize) {
+    let original_size = retained_cdp_event_size(&event);
+    if original_size <= CDP_EVENT_LOG_MAX_ENTRY_BYTES {
+        return (event, original_size);
+    }
+    compact_retained_cdp_value(&mut event);
+    if retained_cdp_event_size(&event) > CDP_EVENT_LOG_MAX_ENTRY_BYTES {
+        let mut retained = serde_json::Map::new();
+        for key in ["sessionId", "method", "__rustwright_cdp_event_seq"] {
+            if let Some(value) = event.get(key) {
+                retained.insert(key.to_string(), value.clone());
+            }
+        }
+        let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        if let Some(mut params) = event
+            .get("params")
+            .and_then(|params| retained_cdp_event_params(method, params))
+        {
+            compact_retained_cdp_value(&mut params);
+            let mut candidate = retained.clone();
+            candidate.insert("params".to_string(), params.clone());
+            if retained_cdp_event_size(&Value::Object(candidate)) <= CDP_EVENT_LOG_MAX_ENTRY_BYTES {
+                retained.insert("params".to_string(), params);
+            }
+        }
+        retained.insert(CDP_EVENT_UNREPLAYABLE_MARKER.to_string(), Value::Bool(true));
+        event = Value::Object(retained);
+    }
+    let retained_size = retained_cdp_event_size(&event);
+    (event, retained_size)
+}
+
+fn is_unreplayable_cdp_event(event: &Value) -> bool {
+    event
+        .get(CDP_EVENT_UNREPLAYABLE_MARKER)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+struct CdpRetentionGate {
+    write_lock: Mutex<()>,
+    enabled: AtomicBool,
+}
+
+impl CdpRetentionGate {
+    fn new() -> Self {
+        Self {
+            write_lock: Mutex::new(()),
+            enabled: AtomicBool::new(true),
+        }
+    }
+
+    fn lock_for_write(&self) -> Option<MutexGuard<'_, ()>> {
+        let guard = self.write_lock.lock().unwrap();
+        self.enabled.load(Ordering::SeqCst).then_some(guard)
+    }
+    fn lock_for_release(&self) -> MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap()
+    }
+
+    fn disable(&self) {
+        let _guard = self.write_lock.lock().unwrap();
+        self.enabled.store(false, Ordering::SeqCst);
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+}
+
+struct CdpEventLogEntry {
+    sequence: u64,
+    event: Value,
+    retained_bytes: usize,
+}
+
 struct CdpEventLog {
     next_seq: u64,
-    events: VecDeque<(u64, Value)>,
+    events: VecDeque<CdpEventLogEntry>,
+    retained_bytes: usize,
+    retention_gate: Arc<CdpRetentionGate>,
     action_dispatch_receipts: HashMap<String, ActionDispatchReceiptMap>,
+    console_replay_cutoffs: HashMap<String, u64>,
+    console_replay_cutoff_generations: HashMap<String, u64>,
+    console_replay_cutoff_cancellations: HashMap<String, u64>,
+    next_console_replay_cutoff_generation: u64,
 }
 
 impl CdpEventLog {
@@ -23995,8 +25773,88 @@ impl CdpEventLog {
         Self {
             next_seq: 0,
             events: VecDeque::with_capacity(CDP_EVENT_LOG_LIMIT),
+            retained_bytes: 0,
+            retention_gate: Arc::new(CdpRetentionGate::new()),
             action_dispatch_receipts: HashMap::new(),
+            console_replay_cutoff_cancellations: HashMap::new(),
+            console_replay_cutoffs: HashMap::new(),
+            console_replay_cutoff_generations: HashMap::new(),
+            next_console_replay_cutoff_generation: 0,
         }
+    }
+
+    fn begin_console_replay_cutoff(&mut self, session_id: &str) -> u64 {
+        advance_lifetime_counter(&mut self.next_console_replay_cutoff_generation);
+        let generation = self.next_console_replay_cutoff_generation;
+        self.console_replay_cutoff_generations
+            .insert(session_id.to_string(), generation);
+        self.console_replay_cutoff_cancellations.remove(session_id);
+        // The provisional sentinel is deliberately published in the event-log metadata.
+        // Every ordered consumer reads this map, so no replay event can pass while Runtime.enable
+        // is still in flight.
+        self.console_replay_cutoffs
+            .insert(session_id.to_string(), u64::MAX);
+        generation
+    }
+
+    fn finalize_console_replay_cutoff(&mut self, session_id: &str, generation: u64, cutoff: u64) {
+        if self.console_replay_cutoff_generations.get(session_id) == Some(&generation) {
+            self.console_replay_cutoffs
+                .insert(session_id.to_string(), cutoff);
+            self.console_replay_cutoff_cancellations.remove(session_id);
+            self.prune_console_replay_cutoffs();
+        }
+    }
+    fn cancel_console_replay_cutoff(&mut self, session_id: &str, generation: u64) {
+        if self.console_replay_cutoff_generations.get(session_id) == Some(&generation) {
+            let cutoff = self.cursor();
+            self.console_replay_cutoffs
+                .insert(session_id.to_string(), cutoff);
+            self.console_replay_cutoff_generations.remove(session_id);
+            self.console_replay_cutoff_cancellations
+                .insert(session_id.to_string(), generation);
+            self.prune_console_replay_cutoffs();
+        }
+    }
+    fn finalize_console_replay_cutoff_on_detach(&mut self, session_id: &str, cutoff: Option<u64>) {
+        let generation = self.console_replay_cutoff_generations.remove(session_id);
+        if self.console_replay_cutoffs.get(session_id) == Some(&u64::MAX) {
+            self.console_replay_cutoffs.insert(
+                session_id.to_string(),
+                cutoff.unwrap_or_else(|| self.cursor()),
+            );
+            if let Some(generation) = generation {
+                self.console_replay_cutoff_cancellations
+                    .insert(session_id.to_string(), generation);
+            }
+        }
+        self.prune_console_replay_cutoffs();
+    }
+
+    fn console_replay_cutoff_with_generation(&self, session_id: &str) -> Option<(u64, u64)> {
+        let generation = self
+            .console_replay_cutoff_generations
+            .get(session_id)
+            .copied()
+            .or_else(|| {
+                self.console_replay_cutoff_cancellations
+                    .get(session_id)
+                    .copied()
+            })?;
+        Some((generation, self.console_replay_cutoff(session_id)?))
+    }
+    fn console_replay_cutoff(&self, session_id: &str) -> Option<u64> {
+        self.console_replay_cutoffs.get(session_id).copied()
+    }
+
+    fn prune_console_replay_cutoffs(&mut self) {
+        let oldest_seq = self.oldest_seq();
+        self.console_replay_cutoffs
+            .retain(|_, stored| *stored == u64::MAX || *stored >= oldest_seq);
+        self.console_replay_cutoff_cancellations
+            .retain(|session_id, _| self.console_replay_cutoffs.contains_key(session_id));
+        self.console_replay_cutoff_generations
+            .retain(|session_id, _| self.console_replay_cutoffs.contains_key(session_id));
     }
 
     fn cursor(&self) -> u64 {
@@ -24012,12 +25870,30 @@ impl CdpEventLog {
                 Value::Number(seq.into()),
             );
         }
-        self.events.push_back((seq, event.clone()));
-        while self.events.len() > CDP_EVENT_LOG_LIMIT {
-            self.events.pop_front();
+        let (retained_event, retained_bytes) = compact_retained_cdp_event(event.clone());
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.events.push_back(CdpEventLogEntry {
+            sequence: seq,
+            event: retained_event,
+            retained_bytes,
+        });
+        while self.events.len() > CDP_EVENT_LOG_LIMIT
+            || self.retained_bytes > CDP_EVENT_LOG_MAX_BYTES
+        {
+            let Some(evicted) = self.events.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes);
+        }
+        // Cutoff pruning is low-water driven, not part of the hot event path. A bounded batch
+        // keeps the map inexpensive under high-volume Runtime/Network traffic.
+        let oldest_seq = self.oldest_seq();
+        if oldest_seq != 0 && oldest_seq % 256 == 0 {
+            self.prune_console_replay_cutoffs();
         }
         event
     }
+
     fn register_action_dispatch(
         &mut self,
         session_id: &str,
@@ -24048,8 +25924,8 @@ impl CdpEventLog {
         dispatch_id: &str,
     ) -> Option<ActionDispatchReceipt> {
         self.action_dispatch_receipts
-            .get(session_id)?
-            .receipt(dispatch_id)
+            .get(session_id)
+            .and_then(|receipts| receipts.receipt(dispatch_id))
     }
 
     fn settle_action_dispatch(&mut self, session_id: &str, dispatch_id: &str) -> Option<String> {
@@ -24061,33 +25937,58 @@ impl CdpEventLog {
         result
     }
 
-    fn entries_since(&self, cursor: u64) -> Vec<(u64, Value)> {
-        self.events
-            .iter()
-            .filter(|(seq, _)| *seq >= cursor)
-            .map(|(seq, event)| (*seq, event.clone()))
-            .collect()
+    fn clear_retained(&mut self) {
+        self.events = VecDeque::new();
+        self.retained_bytes = 0;
+        self.action_dispatch_receipts = HashMap::new();
+        self.console_replay_cutoffs = HashMap::new();
+        self.console_replay_cutoff_generations = HashMap::new();
+        self.console_replay_cutoff_cancellations = HashMap::new();
     }
-    fn entries_between(&self, start: u64, end: u64) -> Vec<(u64, Value)> {
+
+    fn entries_since(&self, cursor: u64) -> Vec<(u64, Value)> {
+        self.entries_since_limited(cursor, usize::MAX)
+    }
+
+    fn entries_since_limited(&self, cursor: u64, limit: usize) -> Vec<(u64, Value)> {
+        let oldest = self.oldest_seq();
+        let start = cursor.saturating_sub(oldest) as usize;
         self.events
             .iter()
-            .filter(|(seq, _)| *seq >= start && *seq < end)
-            .map(|(seq, event)| (*seq, event.clone()))
+            .skip(start)
+            .take(limit)
+            .map(|entry| (entry.sequence, entry.event.clone()))
             .collect()
     }
 
-    fn cursor_after_event(&self, cursor: u64, event: &Value) -> u64 {
+    fn entries_between(&self, start: u64, end: u64) -> Vec<(u64, Value)> {
+        let oldest = self.oldest_seq();
+        let start_index = start.saturating_sub(oldest) as usize;
         self.events
             .iter()
-            .find(|(seq, candidate)| *seq >= cursor && candidate == event)
-            .map(|(seq, _)| seq.wrapping_add(1))
+            .skip(start_index)
+            .take(end.saturating_sub(start) as usize)
+            .map(|entry| (entry.sequence, entry.event.clone()))
+            .collect()
+    }
+    fn cursor_after_event(&self, cursor: u64, event: &Value) -> u64 {
+        if let Some(sequence) = cdp_event_sequence(event) {
+            return sequence
+                .checked_add(1)
+                .filter(|next| *next > cursor)
+                .unwrap_or(cursor);
+        }
+        self.events
+            .iter()
+            .find(|entry| entry.sequence >= cursor && entry.event == *event)
+            .map(|entry| entry.sequence.wrapping_add(1))
             .unwrap_or(cursor)
     }
 
     fn oldest_seq(&self) -> u64 {
         self.events
             .front()
-            .map(|(seq, _)| *seq)
+            .map(|entry| entry.sequence)
             .unwrap_or(self.next_seq)
     }
 }
@@ -24102,6 +26003,10 @@ fn dispatch_cdp_payload_with_diagnostics(
     runtime_state: Arc<Mutex<CdpRuntimeState>>,
     playwright_like_first_reply: Option<&AtomicBool>,
 ) {
+    let retention_gate = event_log.lock().unwrap().retention_gate.clone();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
     if let Some(id) = payload.get("id").and_then(Value::as_u64) {
         let sender = pending.lock().unwrap().remove(&id);
         let command = outstanding.lock().unwrap().remove(&id);
@@ -24190,7 +26095,12 @@ fn close_pending_cdp_commands(
     pending: CdpPendingMap,
     outstanding: CdpOutstandingMap,
     traffic_log: Arc<Mutex<CdpTrafficLog>>,
+    event_log: Arc<Mutex<CdpEventLog>>,
 ) {
+    let retention_gate = event_log.lock().unwrap().retention_gate.clone();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
     let pending_commands = {
         let mut pending = pending.lock().unwrap();
         pending.drain().collect::<Vec<_>>()
@@ -24518,6 +26428,7 @@ impl CdpClient {
         let (events, _) = broadcast::channel(4096);
         let events_reader = events.clone();
         let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let event_log_writer = Arc::clone(&event_log);
         let event_log_reader = Arc::clone(&event_log);
         let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
         let traffic_log_writer = Arc::clone(&traffic_log);
@@ -24565,10 +26476,14 @@ impl CdpClient {
                         }
                         if written {
                             if let Some(diagnostic) = diagnostic {
-                                traffic_log_writer
-                                    .lock()
-                                    .unwrap()
-                                    .push(diagnostic.traffic_entry("sent"));
+                                let retention_gate =
+                                    event_log_writer.lock().unwrap().retention_gate.clone();
+                                if let Some(_retention_guard) = retention_gate.lock_for_write() {
+                                    traffic_log_writer
+                                        .lock()
+                                        .unwrap()
+                                        .push(diagnostic.traffic_entry("sent"));
+                                };
                             }
                         }
                         if !written {
@@ -24610,7 +26525,12 @@ impl CdpClient {
             }
             alive_reader.store(false, Ordering::SeqCst);
             alive_tx_reader.send_replace(false);
-            close_pending_cdp_commands(pending_reader, outstanding_reader, traffic_log_reader);
+            close_pending_cdp_commands(
+                pending_reader,
+                outstanding_reader,
+                traffic_log_reader,
+                event_log_reader,
+            );
         });
 
         Ok(Arc::new(Self {
@@ -24646,6 +26566,7 @@ impl CdpClient {
         let (events, _) = broadcast::channel(4096);
         let events_dispatcher = events.clone();
         let event_log = Arc::new(Mutex::new(CdpEventLog::new()));
+        let event_log_writer = Arc::clone(&event_log);
         let event_log_dispatcher = Arc::clone(&event_log);
         let traffic_log = Arc::new(Mutex::new(CdpTrafficLog::new()));
         let traffic_log_writer = Arc::clone(&traffic_log);
@@ -24691,10 +26612,14 @@ impl CdpClient {
                         }
                         if written {
                             if let Some(diagnostic) = diagnostic {
-                                traffic_log_writer
-                                    .lock()
-                                    .unwrap()
-                                    .push(diagnostic.traffic_entry("sent"));
+                                let retention_gate =
+                                    event_log_writer.lock().unwrap().retention_gate.clone();
+                                if let Some(_retention_guard) = retention_gate.lock_for_write() {
+                                    traffic_log_writer
+                                        .lock()
+                                        .unwrap()
+                                        .push(diagnostic.traffic_entry("sent"));
+                                };
                             }
                         }
                         if !written {
@@ -24753,6 +26678,7 @@ impl CdpClient {
                 pending_dispatcher,
                 outstanding_dispatcher,
                 traffic_log_dispatcher,
+                event_log_dispatcher,
             );
         });
 
@@ -24793,6 +26719,13 @@ impl CdpClient {
         dispatch_id: &str,
         token: &str,
     ) -> RwResult<PendingActionDispatchGuard<'a>> {
+        let retention_gate = self.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            return Err(RwError::Disconnected);
+        };
+        if !self.is_connected() {
+            return Err(RwError::Disconnected);
+        }
         let registered = self.event_log.lock().unwrap().register_action_dispatch(
             session_id,
             dispatch_id.to_string(),
@@ -24833,6 +26766,14 @@ impl CdpClient {
         self.alive.load(Ordering::SeqCst)
     }
 
+    fn retention_gate(&self) -> Arc<CdpRetentionGate> {
+        self.event_log.lock().unwrap().retention_gate.clone()
+    }
+
+    fn retention_enabled(&self) -> bool {
+        self.retention_gate().is_enabled()
+    }
+
     fn close(&self) {
         self.alive.store(false, Ordering::SeqCst);
         self.alive_tx.send_replace(false);
@@ -24842,6 +26783,17 @@ impl CdpClient {
     fn mark_closed(&self) {
         self.alive.store(false, Ordering::SeqCst);
         self.alive_tx.send_replace(false);
+    }
+
+    fn release_memory_buffers(&self) {
+        // Serialize terminal release with every dispatcher and page-event write. Once disabled,
+        // no reader or in-flight handler can repopulate the stores after this clear.
+        self.retention_gate().disable();
+        self.event_log.lock().unwrap().clear_retained();
+        self.traffic_log.lock().unwrap().clear_for_close();
+        self.runtime_state.lock().unwrap().clear_for_close();
+        self.pending.lock().unwrap().clear();
+        self.outstanding.lock().unwrap().clear();
     }
 
     fn record_sent_command(&self, method: &str) {
@@ -24963,6 +26915,10 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> RwResult<QueuedCdpCommand> {
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
         if !self.is_connected() {
             return Err(RwError::Disconnected);
         }
@@ -24979,8 +26935,13 @@ impl CdpClient {
                 write_state: Arc::new(CdpWriteState::new()),
             },
         );
-        let pending_guard =
-            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+        let pending_guard = PendingCommandGuard::new(
+            id,
+            &self.pending,
+            &self.outstanding,
+            &self.traffic_log,
+            &retention_gate,
+        );
 
         let mut payload = json!({
             "id": id,
@@ -25004,10 +26965,12 @@ impl CdpClient {
             })
         };
         if send_result.is_err() {
+            drop(retention_guard);
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
+        drop(retention_guard);
         Ok(QueuedCdpCommand {
             method: method.to_string(),
             timeout,
@@ -25086,6 +27049,10 @@ impl CdpClient {
         tracker: Option<CdpWriteTracker>,
         event_cursor: Option<&mut u64>,
     ) -> RwResult<Value> {
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
         if !self.is_connected() {
             return Err(RwError::Disconnected);
         }
@@ -25106,8 +27073,13 @@ impl CdpClient {
                 write_state,
             },
         );
-        let _pending_guard =
-            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+        let _pending_guard = PendingCommandGuard::new(
+            id,
+            &self.pending,
+            &self.outstanding,
+            &self.traffic_log,
+            &retention_gate,
+        );
 
         let mut payload = json!({
             "id": id,
@@ -25137,10 +27109,12 @@ impl CdpClient {
             None => self.write_tx.send(outgoing),
         };
         if send_result.is_err() {
+            drop(retention_guard);
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
+        drop(retention_guard);
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result.map_err(|error| wrap_cdp_command_error(method, error)),
@@ -25156,9 +27130,18 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> RwResult<Value> {
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
         if !self.is_connected() {
             return Err(RwError::Disconnected);
         }
+        let method_json = serde_json::to_string(method)?;
+        let session_id_json = match session_id {
+            Some(session_id) => Some(serde_json::to_string(session_id)?),
+            None => None,
+        };
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -25172,12 +27155,15 @@ impl CdpClient {
                 write_state: Arc::new(CdpWriteState::new()),
             },
         );
-        let _pending_guard =
-            PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+        let _pending_guard = PendingCommandGuard::new(
+            id,
+            &self.pending,
+            &self.outstanding,
+            &self.traffic_log,
+            &retention_gate,
+        );
 
-        let method_json = serde_json::to_string(method)?;
-        let payload = if let Some(session_id) = session_id {
-            let session_id_json = serde_json::to_string(session_id)?;
+        let payload = if let Some(session_id_json) = &session_id_json {
             format!(
                 "{{\"id\":{id},\"method\":{method_json},\"params\":{params_json},\"sessionId\":{session_id_json}}}"
             )
@@ -25194,10 +27180,12 @@ impl CdpClient {
             })
             .is_err()
         {
+            drop(retention_guard);
             self.mark_closed();
             return Err(RwError::Disconnected);
         }
         self.record_sent_command(method);
+        drop(retention_guard);
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result.map_err(|error| match error {
@@ -25219,14 +27207,18 @@ impl CdpClient {
         session_id: Option<&str>,
         timeout: Duration,
     ) -> RwResult<Vec<Value>> {
-        if !self.is_connected() {
-            return Err(RwError::Disconnected);
-        }
         let method_json = serde_json::to_string(method)?;
         let session_id_json = match session_id {
             Some(session_id) => Some(serde_json::to_string(session_id)?),
             None => None,
         };
+        let retention_gate = self.retention_gate();
+        let retention_guard = retention_gate
+            .lock_for_write()
+            .ok_or(RwError::Disconnected)?;
+        if !self.is_connected() {
+            return Err(RwError::Disconnected);
+        }
         let mut receivers = Vec::with_capacity(params_json_list.len());
         for params_json in params_json_list {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -25242,8 +27234,13 @@ impl CdpClient {
                     write_state: Arc::new(CdpWriteState::new()),
                 },
             );
-            let pending_guard =
-                PendingCommandGuard::new(id, &self.pending, &self.outstanding, &self.traffic_log);
+            let pending_guard = PendingCommandGuard::new(
+                id,
+                &self.pending,
+                &self.outstanding,
+                &self.traffic_log,
+                &retention_gate,
+            );
 
             let payload = if let Some(session_id_json) = &session_id_json {
                 format!(
@@ -25262,12 +27259,14 @@ impl CdpClient {
                 })
                 .is_err()
             {
+                drop(retention_guard);
                 self.mark_closed();
                 return Err(RwError::Disconnected);
             }
             self.record_sent_command(method);
             receivers.push((id, rx, pending_guard));
         }
+        drop(retention_guard);
 
         let mut results = Vec::with_capacity(receivers.len());
         for (_id, rx, _pending_guard) in receivers {
@@ -26042,6 +28041,7 @@ async fn close_browser_cleanup(browser: Arc<BrowserInner>) -> RwResult<()> {
             .await;
     }
     browser.client.close();
+    browser.client.release_memory_buffers();
     browser.attached_pages.clear();
 
     tokio::task::spawn_blocking(move || -> RwResult<()> {
@@ -26305,6 +28305,7 @@ struct IframeSetupTaskRegistry {
     handles: Mutex<HashMap<u64, IframeSetupTaskEntry>>,
     next_token: AtomicU64,
     permits: Arc<tokio::sync::Semaphore>,
+    auto_attach_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Default for IframeSetupTaskRegistry {
@@ -26315,11 +28316,20 @@ impl Default for IframeSetupTaskRegistry {
             permits: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_ATTACHED_IFRAME_SETUPS,
             )),
+            auto_attach_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl IframeSetupTaskRegistry {
+    fn auto_attach_lock_for_session(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.auto_attach_locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
     fn abort_generations(&self, generations: impl IntoIterator<Item = u64>) {
         let mut handles = self.handles.lock().unwrap();
         for generation in generations {
@@ -26372,7 +28382,7 @@ struct PageInner {
 #[derive(Default)]
 struct ConsoleCaptureState {
     requested: AtomicBool,
-    enabled_sessions: tokio::sync::Mutex<HashSet<String>>,
+    enabled_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 struct CreatedTargetGuard {
@@ -26544,8 +28554,60 @@ impl PageInner {
     fn abort_iframe_setup_tasks(&self) {
         self.iframe_setup_tasks.abort_all();
     }
+    fn clear_worker_resume_handoffs(&self) {
+        let retention_gate = self.browser.client.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            return;
+        };
+        self.clear_worker_resume_handoffs_locked();
+    }
+
+    fn clear_worker_resume_handoffs_locked(&self) {
+        self.frame_state
+            .lock()
+            .unwrap()
+            .clear_worker_resume_handoffs();
+    }
+
+    fn release_memory_buffers(&self) {
+        self.target_closed.store(true, Ordering::SeqCst);
+        let retention_gate = self.browser.client.retention_gate();
+        let _retention_guard = retention_gate.lock_for_release();
+        self.network_requests.lock().unwrap().clear_for_close();
+        self.native_network_records
+            .lock()
+            .unwrap()
+            .clear_for_close();
+        self.console_records.lock().unwrap().clear_for_close();
+        self.console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .clear();
+        self.frame_state.lock().unwrap().clear_for_close();
+        self.console_capture
+            .requested
+            .store(false, Ordering::SeqCst);
+        let enabled_sessions = Arc::clone(&self.console_capture.enabled_sessions);
+        let sessions_cleared = match enabled_sessions.try_lock() {
+            Ok(mut enabled_sessions_guard) => {
+                enabled_sessions_guard.clear();
+                true
+            }
+            Err(_) => false,
+        };
+        if !sessions_cleared {
+            if let Some(runtime) = self.browser.runtime.0.as_ref() {
+                runtime.spawn(async move {
+                    enabled_sessions.lock().await.clear();
+                });
+            }
+        }
+        self.background_override_active
+            .store(false, Ordering::SeqCst);
+    }
 
     fn close_in_background(&self) {
+        self.clear_worker_resume_handoffs();
         self.abort_iframe_setup_tasks();
         if !self.close_target_on_drop.swap(false, Ordering::SeqCst)
             || self.lifecycle.is_closing_or_closed()
@@ -26646,6 +28708,9 @@ impl NetworkRequestStore {
         self.applied_order.clear();
         self.reset_generation = self.reset_clock.fetch_add(1, Ordering::SeqCst) + 1;
         self.reset_cursor = next_applied_seq;
+    }
+    fn clear_for_close(&mut self) {
+        self.reset_after_overflow(self.next_applied_seq);
     }
 
     fn record_applied_request(&mut self, seq: u64, request_id: String) {
@@ -26818,6 +28883,21 @@ struct ConsoleRecordStore {
 }
 
 impl ConsoleRecordStore {
+    fn clear_for_close(&mut self) {
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.navigation_epoch = 0;
+        self.records = VecDeque::new();
+        self.evictions_by_epoch = HashMap::new();
+        self.evictions_total = 0;
+    }
+    fn reset_after_unreplayable(&mut self) {
+        let epoch = self.navigation_epoch;
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.records.clear();
+        self.evictions_by_epoch.clear();
+        self.evictions_by_epoch.insert(epoch, 1);
+        self.evictions_total = self.evictions_total.saturating_add(1);
+    }
     fn record_navigation(&mut self, sequence: Option<u64>, epoch: u64) -> bool {
         if !self.accepted_navigation_epochs.accepts(sequence) {
             return false;
@@ -26948,6 +29028,23 @@ impl NativeNetworkRecordStore {
             active_by_request: HashMap::new(),
             evictions_by_epoch: HashMap::new(),
         }
+    }
+    fn clear_for_close(&mut self) {
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.navigation_epoch = 0;
+        self.navigation_start_index = 0;
+        self.current_loader_id = None;
+        self.records = VecDeque::new();
+        self.active_by_request = HashMap::new();
+        self.evictions_by_epoch = HashMap::new();
+    }
+    fn reset_after_unreplayable(&mut self) {
+        let epoch = self.navigation_epoch;
+        self.accepted_navigation_epochs = AcceptedNavigationEpochs::default();
+        self.records.clear();
+        self.active_by_request.clear();
+        self.evictions_by_epoch.clear();
+        self.evictions_by_epoch.insert(epoch, 1);
     }
 
     fn begin_document_navigation(
@@ -27288,10 +29385,32 @@ struct AuthoritativeFrameTreeCommitEffects {
     removed_setup_generations: Vec<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerResumeHandoffPhase {
+    CaptureReady,
+    ResumeClaimed,
+    ResumeCompleted,
+    ResumeFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerResumeHandoff {
+    sequence: u64,
+    phase: WorkerResumeHandoffPhase,
+    python_capture_ready: bool,
+}
+
 #[derive(Debug)]
 struct PageFrameState {
     main_session_id: String,
     frame_sessions: HashMap<String, String>,
+    worker_sessions: HashSet<String>,
+    worker_target_sessions: HashMap<String, String>,
+    worker_session_event_sequences: HashMap<String, u64>,
+    worker_forwarding_interest: bool,
+    worker_resume_handoffs: HashMap<String, WorkerResumeHandoff>,
+    worker_event_interest: bool,
+    worker_auto_attach_requested: bool,
     frame_attachment_generations: HashMap<String, u64>,
     frame_swaps: HashMap<String, FrameSwapState>,
     frame_session_waiters: HashMap<String, HashMap<u64, usize>>,
@@ -27327,6 +29446,13 @@ impl PageFrameState {
         Self {
             main_session_id,
             frame_sessions: HashMap::new(),
+            worker_sessions: HashSet::new(),
+            worker_target_sessions: HashMap::new(),
+            worker_session_event_sequences: HashMap::new(),
+            worker_resume_handoffs: HashMap::new(),
+            worker_event_interest: false,
+            worker_forwarding_interest: false,
+            worker_auto_attach_requested: false,
             frame_attachment_generations: HashMap::new(),
             frame_swaps: HashMap::new(),
             frame_session_waiters: HashMap::new(),
@@ -27356,9 +29482,333 @@ impl PageFrameState {
             session_updates,
         }
     }
+    fn clear_for_close(&mut self) {
+        self.frame_sessions = HashMap::new();
+        self.worker_sessions = HashSet::new();
+        self.worker_target_sessions = HashMap::new();
+        self.worker_session_event_sequences = HashMap::new();
+        self.worker_resume_handoffs = HashMap::new();
+        self.frame_attachment_generations = HashMap::new();
+        self.frame_swaps = HashMap::new();
+        self.frame_session_waiters = HashMap::new();
+        self.frame_attachment_locks = HashMap::new();
+        self.session_frames = HashMap::new();
+        self.frames = HashMap::new();
+        self.child_order = HashMap::new();
+        self.frame_loader_ids = HashMap::new();
+        self.execution_contexts = HashMap::new();
+        self.frame_session_errors = HashMap::new();
+        self.iframe_sessions_armed = HashSet::new();
+        self.iframe_sessions_routable = HashSet::new();
+        self.iframe_sessions_ready = HashSet::new();
+        self.iframe_setup_started = HashSet::new();
+        self.page_domain_enabled_sessions = HashSet::new();
+        self.frame_tree_populated_sessions = HashSet::new();
+        self.frame_tree_dirty_sessions = HashSet::new();
+        self.frame_tree_generations = HashMap::new();
+        self.frame_invalidation_sequences = HashMap::new();
+        self.worker_forwarding_interest = false;
+        self.worker_event_interest = false;
+        self.worker_auto_attach_requested = false;
+        self.frame_event_listener_registered = false;
+        self.frame_ownership_generation = 0;
+        self.frame_event_cursor = 0;
+        #[cfg(test)]
+        {
+            self.locator_resolution_reresolve_count = 0;
+        }
+    }
 
     fn set_frame_event_cursor(&mut self, cursor: u64) {
         self.frame_event_cursor = cursor;
+    }
+
+    fn worker_session_mutation_is_current(&self, session_id: &str, sequence: Option<u64>) -> bool {
+        match sequence {
+            Some(sequence) => self
+                .worker_session_event_sequences
+                .get(session_id)
+                .is_none_or(|last_sequence| sequence > *last_sequence),
+            // Unstamped worker mutations are retained for direct attach APIs, but they
+            // must never overwrite an event whose ordering is already known.
+            None => !self.worker_session_event_sequences.contains_key(session_id),
+        }
+    }
+
+    fn worker_session_attachment_is_current(
+        &self,
+        session_id: &str,
+        sequence: Option<u64>,
+    ) -> bool {
+        match sequence {
+            Some(sequence) => self
+                .worker_session_event_sequences
+                .get(session_id)
+                .is_none_or(|last_sequence| {
+                    sequence > *last_sequence
+                        || (sequence == *last_sequence && self.worker_sessions.contains(session_id))
+                }),
+            None => !self.worker_session_event_sequences.contains_key(session_id),
+        }
+    }
+
+    fn record_worker_session(&mut self, session_id: &str) -> bool {
+        self.record_worker_session_at_sequence(session_id, None)
+    }
+
+    fn record_worker_session_at_sequence(
+        &mut self,
+        session_id: &str,
+        sequence: Option<u64>,
+    ) -> bool {
+        if !self.worker_session_mutation_is_current(session_id, sequence) {
+            return false;
+        }
+        if let Some(sequence) = sequence {
+            self.worker_session_event_sequences
+                .insert(session_id.to_string(), sequence);
+        }
+        let inserted = self.worker_sessions.insert(session_id.to_string());
+        if inserted {
+            self.notify_session_update();
+        }
+        inserted
+    }
+    fn record_worker_target_session_at_sequence(
+        &mut self,
+        target_id: &str,
+        session_id: &str,
+        sequence: Option<u64>,
+    ) -> bool {
+        let accepted = match sequence {
+            Some(_) => {
+                self.worker_session_attachment_is_current(session_id, sequence)
+                    && (self.worker_session_recorded_at_sequence(session_id, sequence)
+                        || self.record_worker_session_at_sequence(session_id, sequence))
+            }
+            None => self.record_worker_session_at_sequence(session_id, None),
+        };
+        if accepted {
+            self.worker_target_sessions
+                .insert(target_id.to_string(), session_id.to_string());
+        }
+        accepted
+    }
+
+    fn associate_worker_target_session(&mut self, target_id: &str, session_id: &str) -> bool {
+        if !self.worker_sessions.contains(session_id) {
+            return false;
+        }
+        self.worker_target_sessions
+            .insert(target_id.to_string(), session_id.to_string());
+        true
+    }
+
+    fn worker_session_for_target(&self, target_id: &str) -> Option<String> {
+        let session_id = self.worker_target_sessions.get(target_id)?;
+        self.worker_sessions
+            .contains(session_id)
+            .then(|| session_id.clone())
+    }
+
+    fn remove_worker_session_at_sequence(
+        &mut self,
+        session_id: &str,
+        sequence: Option<u64>,
+    ) -> bool {
+        if !self.worker_session_mutation_is_current(session_id, sequence) {
+            return false;
+        }
+        self.worker_resume_handoffs.remove(session_id);
+        if let Some(sequence) = sequence {
+            self.worker_session_event_sequences
+                .insert(session_id.to_string(), sequence);
+        }
+        self.worker_target_sessions
+            .retain(|_, owner_session_id| owner_session_id != session_id);
+        let removed = self.worker_sessions.remove(session_id);
+        if removed {
+            self.notify_session_update();
+        }
+        // A sequence-confirmed detach is meaningful even when a different consumer
+        // already removed the set entry. Callers use this result to clear capture state.
+        true
+    }
+
+    fn owns_worker_session(&self, session_id: &str) -> bool {
+        self.worker_sessions.contains(session_id)
+    }
+
+    fn arm_worker_resume_handoff(&mut self, session_id: &str, sequence: Option<u64>) {
+        let sequence = sequence.unwrap_or(0);
+        if self
+            .worker_resume_handoffs
+            .get(session_id)
+            .is_some_and(|handoff| {
+                handoff.sequence >= sequence
+                    || handoff.phase != WorkerResumeHandoffPhase::ResumeCompleted
+            })
+        {
+            return;
+        }
+        self.worker_resume_handoffs.insert(
+            session_id.to_string(),
+            WorkerResumeHandoff {
+                sequence,
+                phase: WorkerResumeHandoffPhase::CaptureReady,
+                python_capture_ready: false,
+            },
+        );
+        self.notify_session_update();
+    }
+
+    fn claim_worker_resume_handoff(&mut self, session_id: &str) -> bool {
+        let Some(handoff) = self.worker_resume_handoffs.get_mut(session_id) else {
+            return false;
+        };
+        if handoff.phase != WorkerResumeHandoffPhase::CaptureReady {
+            return false;
+        }
+        handoff.phase = WorkerResumeHandoffPhase::ResumeClaimed;
+        self.notify_session_update();
+        true
+    }
+
+    fn mark_worker_resume_handoff_failed(&mut self, session_id: &str) -> bool {
+        let Some(handoff) = self.worker_resume_handoffs.get_mut(session_id) else {
+            return false;
+        };
+        if handoff.phase != WorkerResumeHandoffPhase::ResumeClaimed {
+            return false;
+        }
+        handoff.phase = WorkerResumeHandoffPhase::ResumeFailed;
+        self.notify_session_update();
+        true
+    }
+
+    fn complete_worker_resume_handoff(&mut self, session_id: &str) -> bool {
+        let Some(handoff) = self.worker_resume_handoffs.get_mut(session_id) else {
+            return false;
+        };
+        if handoff.phase != WorkerResumeHandoffPhase::ResumeClaimed {
+            return false;
+        }
+        handoff.phase = WorkerResumeHandoffPhase::ResumeCompleted;
+        self.notify_session_update();
+        true
+    }
+    fn mark_worker_capture_ready(&mut self, session_id: &str) -> bool {
+        let Some(handoff) = self.worker_resume_handoffs.get_mut(session_id) else {
+            return false;
+        };
+        if handoff.phase != WorkerResumeHandoffPhase::ResumeClaimed {
+            return false;
+        }
+        handoff.python_capture_ready = true;
+        self.notify_session_update();
+        true
+    }
+
+    fn worker_capture_ready_or_unclaimed(&self, session_id: &str) -> bool {
+        if !self.worker_forwarding_interest {
+            return true;
+        }
+        self.worker_resume_handoffs
+            .get(session_id)
+            .is_none_or(|handoff| {
+                handoff.python_capture_ready
+                    || handoff.phase == WorkerResumeHandoffPhase::ResumeFailed
+            })
+    }
+
+    fn set_worker_forwarding_interest(&mut self, interested: bool) {
+        if self.worker_forwarding_interest != interested {
+            self.worker_forwarding_interest = interested;
+            self.notify_session_update();
+        }
+    }
+
+    fn clear_worker_resume_handoffs(&mut self) {
+        if !self.worker_resume_handoffs.is_empty() {
+            self.worker_resume_handoffs.clear();
+            self.notify_session_update();
+        }
+    }
+    fn prepare_worker_resume(&mut self, session_id: &str) -> bool {
+        let Some(handoff) = self.worker_resume_handoffs.get_mut(session_id) else {
+            // Workers discovered after capture was disabled still need the normal idempotent
+            // Runtime.runIfWaitingForDebugger command.
+            return true;
+        };
+        match handoff.phase {
+            WorkerResumeHandoffPhase::ResumeCompleted => false,
+            WorkerResumeHandoffPhase::CaptureReady | WorkerResumeHandoffPhase::ResumeFailed => {
+                handoff.phase = WorkerResumeHandoffPhase::ResumeClaimed;
+                self.notify_session_update();
+                true
+            }
+            WorkerResumeHandoffPhase::ResumeClaimed => true,
+        }
+    }
+
+    fn take_worker_resume_fallback(&mut self, session_id: &str) -> bool {
+        if !self.worker_sessions.contains(session_id) {
+            return false;
+        }
+        let Some(handoff) = self.worker_resume_handoffs.get_mut(session_id) else {
+            return false;
+        };
+        if !matches!(
+            handoff.phase,
+            WorkerResumeHandoffPhase::CaptureReady | WorkerResumeHandoffPhase::ResumeFailed
+        ) {
+            return false;
+        }
+        handoff.phase = WorkerResumeHandoffPhase::ResumeClaimed;
+        self.notify_session_update();
+        true
+    }
+
+    fn worker_resume_handoff_pending(&self, session_id: &str) -> bool {
+        self.worker_resume_handoffs
+            .get(session_id)
+            .is_some_and(|handoff| handoff.phase != WorkerResumeHandoffPhase::ResumeCompleted)
+    }
+
+    fn set_worker_event_interest(&mut self, interested: bool) {
+        if self.worker_event_interest != interested {
+            self.worker_event_interest = interested;
+            self.notify_session_update();
+        }
+    }
+
+    fn worker_event_interest(&self) -> bool {
+        self.worker_event_interest
+    }
+
+    fn mark_worker_auto_attach_requested(&mut self) {
+        self.worker_auto_attach_requested = true;
+    }
+
+    fn worker_auto_attach_requested(&self) -> bool {
+        self.worker_auto_attach_requested
+    }
+
+    fn all_owned_session_ids(&self) -> Vec<String> {
+        let mut sessions = vec![self.main_session_id.clone()];
+        for session_id in self.session_frames.keys() {
+            if !sessions.iter().any(|existing| existing == session_id) {
+                sessions.push(session_id.clone());
+            }
+        }
+        sessions
+    }
+
+    fn worker_session_recorded_at_sequence(&self, session_id: &str, sequence: Option<u64>) -> bool {
+        sequence.is_some_and(|sequence| {
+            self.worker_sessions.contains(session_id)
+                && self.worker_session_event_sequences.get(session_id) == Some(&sequence)
+        })
     }
 
     fn mark_frame_event_listener_registered(&mut self) {
@@ -27774,6 +30224,9 @@ impl PageFrameState {
 
     fn owns_session(&self, session_id: &str) -> bool {
         session_id == self.main_session_id || self.session_frames.contains_key(session_id)
+    }
+    fn owns_frame_target(&self, target_id: &str) -> bool {
+        self.frame_sessions.contains_key(target_id)
     }
 
     fn refresh_registration(&self, session_id: &str) -> Option<(Option<String>, u64)> {
@@ -28701,6 +31154,7 @@ struct PyCdpEventWaiter {
 #[pyclass(name = "Worker")]
 struct PyWorker {
     browser: Arc<BrowserInner>,
+    page: Option<Arc<PageInner>>,
     target_id: String,
     session_id: String,
     url: String,
@@ -28710,6 +31164,7 @@ struct PyWorker {
 #[pyclass(name = "_NetworkEventWaiter")]
 struct PyNetworkEventWaiter {
     browser: Arc<BrowserInner>,
+    page: Arc<PageInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
     event_log: Arc<Mutex<CdpEventLog>>,
     cursor: Mutex<u64>,
@@ -28738,6 +31193,11 @@ struct PyPageEventStream {
 struct PageEventStreamState {
     network: NetworkObservationState,
     ready: BTreeMap<u64, Value>,
+    main_session_id: String,
+    owned_sessions: HashSet<String>,
+    session_parents: HashMap<String, String>,
+    replay_until: HashMap<String, u64>,
+    replay_cutoff_generations: HashMap<String, u64>,
 }
 
 #[cfg(feature = "python")]
@@ -28753,6 +31213,7 @@ struct PageEventStreamLease {
     cursor_slot: Arc<Mutex<u64>>,
     requests: Arc<Mutex<NetworkRequestStore>>,
     working_requests: Arc<Mutex<NetworkRequestStore>>,
+    page: Option<Arc<PageInner>>,
 }
 
 #[cfg(feature = "python")]
@@ -28782,6 +31243,18 @@ impl PageEventStreamLease {
     fn deliver(mut self) {
         self.delivered = true;
     }
+
+    fn commit_delivered(&mut self) {
+        *self.state_slot.lock().unwrap() = self.state.take();
+        *self.cursor_slot.lock().unwrap() = self.cursor;
+        let committed = self.working_requests.lock().unwrap().clone();
+        self.requests.lock().unwrap().merge_committed(&committed);
+    }
+
+    fn restore_rollback(&mut self) {
+        *self.state_slot.lock().unwrap() = self.rollback_state.take();
+        *self.cursor_slot.lock().unwrap() = self.rollback_cursor;
+    }
 }
 
 #[cfg(feature = "python")]
@@ -28789,23 +31262,271 @@ impl Drop for PageEventStreamLease {
     fn drop(&mut self) {
         *self.receiver_slot.lock().unwrap() = self.receiver.take();
         if self.delivered {
-            *self.state_slot.lock().unwrap() = self.state.take();
-            *self.cursor_slot.lock().unwrap() = self.cursor;
-            let committed = self.working_requests.lock().unwrap().clone();
-            self.requests.lock().unwrap().merge_committed(&committed);
+            if let Some(page) = self.page.as_ref().map(Arc::clone) {
+                let retention_gate = page.browser.client.retention_gate();
+                let Some(_retention_guard) = retention_gate.lock_for_write() else {
+                    self.restore_rollback();
+                    return;
+                };
+                if page.lifecycle.is_closing_or_closed()
+                    || page.target_closed.load(Ordering::SeqCst)
+                {
+                    self.restore_rollback();
+                    return;
+                }
+            }
+            self.commit_delivered();
         } else {
-            *self.state_slot.lock().unwrap() = self.rollback_state.take();
-            *self.cursor_slot.lock().unwrap() = self.rollback_cursor;
+            self.restore_rollback();
         }
     }
 }
 
 impl PageEventStreamState {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::for_session(String::new())
+    }
+
+    fn for_session(main_session_id: String) -> Self {
+        let mut owned_sessions = HashSet::new();
+        if !main_session_id.is_empty() {
+            owned_sessions.insert(main_session_id.clone());
+        }
         Self {
             network: NetworkObservationState::new(),
             ready: BTreeMap::new(),
+            main_session_id,
+            owned_sessions,
+            session_parents: HashMap::new(),
+            replay_until: HashMap::new(),
+            replay_cutoff_generations: HashMap::new(),
         }
+    }
+
+    fn for_page(page: &PageInner) -> Self {
+        let mut state = Self::for_session(page.session_id.clone());
+        let frame_state = page.frame_state.lock().unwrap();
+        state
+            .owned_sessions
+            .extend(frame_state.session_frames.keys().cloned());
+        for frame in frame_state.frames.values() {
+            let Some(child_session_id) = frame.session_id.as_deref() else {
+                continue;
+            };
+            let Some(parent_session_id) = frame
+                .parent_id
+                .as_deref()
+                .and_then(|parent_id| frame_state.frames.get(parent_id))
+                .and_then(|parent| parent.session_id.as_deref())
+            else {
+                continue;
+            };
+            if child_session_id != parent_session_id {
+                state
+                    .session_parents
+                    .insert(child_session_id.to_string(), parent_session_id.to_string());
+            }
+        }
+        drop(frame_state);
+        state.replay_until = page
+            .console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .clone();
+        state
+    }
+
+    #[cfg(any(test, feature = "python"))]
+    fn subscribe_page_event_stream(
+        page: &PageInner,
+    ) -> (broadcast::Receiver<Value>, u64, PageEventStreamState) {
+        let client = &page.browser.client;
+        let event_log = client.event_log.lock().unwrap();
+        let receiver = client.events.subscribe();
+        let event_cursor = event_log.cursor();
+        let entries = event_log.entries_since(0);
+        let replay_cutoffs = event_log.console_replay_cutoffs.clone();
+        let replay_generations = event_log.console_replay_cutoff_generations.clone();
+        let replay_cancellations = event_log.console_replay_cutoff_cancellations.clone();
+        drop(event_log);
+        let retention_gate = client.retention_gate();
+        let Some(_retention_guard) = retention_gate.lock_for_write() else {
+            return (receiver, event_cursor, PageEventStreamState::for_page(page));
+        };
+        if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+            return (receiver, event_cursor, PageEventStreamState::for_page(page));
+        }
+        let mut page_state = PageEventStreamState::for_page(page);
+        for (sequence, event) in entries {
+            if sequence >= event_cursor {
+                break;
+            }
+            if is_unreplayable_cdp_event(&event) {
+                page_state.reset_after_overflow();
+                page.network_requests
+                    .lock()
+                    .unwrap()
+                    .reset_after_overflow(sequence.saturating_add(1));
+                page_state.ready.insert(
+                    sequence,
+                    page_event_envelope(
+                        sequence,
+                        "_overflow",
+                        json!({
+                            "dropped": 1,
+                            "reason": "unreplayable_event",
+                        }),
+                    ),
+                );
+                continue;
+            }
+            page_state.apply_target_transition(&event, &page.session_id);
+        }
+        page_state.seed_replay_cutoffs(&replay_cutoffs);
+        for session_id in replay_cutoffs.keys() {
+            if let Some(generation) = replay_generations
+                .get(session_id)
+                .copied()
+                .or_else(|| replay_cancellations.get(session_id).copied())
+            {
+                page_state
+                    .replay_cutoff_generations
+                    .insert(session_id.clone(), generation);
+            }
+        }
+        (receiver, event_cursor, page_state)
+    }
+
+    fn seed_replay_cutoffs(&mut self, replay_until: &HashMap<String, u64>) {
+        for (session_id, cutoff) in replay_until {
+            self.replay_until
+                .entry(session_id.clone())
+                .and_modify(|stored| merge_console_replay_cutoff(stored, *cutoff))
+                .or_insert(*cutoff);
+        }
+    }
+
+    fn sync_replay_cutoffs_for_event(
+        &mut self,
+        event: &Value,
+        event_log: &Arc<Mutex<CdpEventLog>>,
+    ) {
+        if !matches!(
+            event.get("method").and_then(Value::as_str),
+            Some(
+                "Target.attachedToTarget"
+                    | "Target.detachedFromTarget"
+                    | "Runtime.consoleAPICalled"
+                    | "Runtime.exceptionThrown"
+            )
+        ) {
+            return;
+        }
+        let mut session_ids = Vec::with_capacity(2);
+        if let Some(session_id) = event.get("sessionId").and_then(Value::as_str) {
+            session_ids.push(session_id);
+        }
+        if let Some(session_id) = event.pointer("/params/sessionId").and_then(Value::as_str) {
+            session_ids.push(session_id);
+        }
+        if session_ids.is_empty() {
+            return;
+        }
+        let log = event_log.lock().unwrap();
+        for session_id in session_ids {
+            let Some(cutoff) = log.console_replay_cutoff(session_id) else {
+                continue;
+            };
+            if let Some((generation, _)) = log.console_replay_cutoff_with_generation(session_id) {
+                if self
+                    .replay_cutoff_generations
+                    .get(session_id)
+                    .is_some_and(|stored| *stored > generation)
+                {
+                    continue;
+                }
+                self.replay_cutoff_generations
+                    .insert(session_id.to_string(), generation);
+            }
+            self.replay_until
+                .entry(session_id.to_string())
+                .and_modify(|stored| merge_console_replay_cutoff(stored, cutoff))
+                .or_insert(cutoff);
+        }
+    }
+
+    fn ensure_main_session(&mut self, session_id: &str) {
+        if self.main_session_id.is_empty() {
+            self.main_session_id = session_id.to_string();
+        }
+        self.owned_sessions.insert(self.main_session_id.clone());
+    }
+
+    fn owns_session(&self, session_id: &str) -> bool {
+        session_id == self.main_session_id || self.owned_sessions.contains(session_id)
+    }
+
+    fn apply_target_transition(&mut self, event: &Value, session_id: &str) {
+        self.ensure_main_session(session_id);
+        match event.get("method").and_then(Value::as_str) {
+            Some("Target.attachedToTarget") => {
+                let target_info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
+                if target_info.get("type").and_then(Value::as_str) != Some("iframe") {
+                    return;
+                }
+                let Some(parent_session_id) = event.get("sessionId").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(child_session_id) =
+                    event.pointer("/params/sessionId").and_then(Value::as_str)
+                else {
+                    return;
+                };
+                if self.owns_session(parent_session_id) {
+                    self.owned_sessions.insert(child_session_id.to_string());
+                    self.session_parents
+                        .insert(child_session_id.to_string(), parent_session_id.to_string());
+                }
+            }
+            Some("Target.detachedFromTarget") => {
+                let Some(detached_session_id) =
+                    event.pointer("/params/sessionId").and_then(Value::as_str)
+                else {
+                    return;
+                };
+                if detached_session_id == self.main_session_id {
+                    return;
+                }
+                let mut pending = vec![detached_session_id.to_string()];
+                while let Some(session_id) = pending.pop() {
+                    self.replay_until.remove(&session_id);
+                    if !self.owned_sessions.remove(&session_id) {
+                        continue;
+                    }
+                    let children = self
+                        .session_parents
+                        .iter()
+                        .filter_map(|(child, parent)| {
+                            (parent == &session_id).then_some(child.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    pending.extend(children);
+                    self.session_parents.remove(&session_id);
+                }
+                self.session_parents.retain(|child, parent| {
+                    self.owned_sessions.contains(child) && self.owned_sessions.contains(parent)
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn reset_after_overflow(&mut self) {
+        self.network = NetworkObservationState::new();
+        self.ready.clear();
+        self.replay_until.clear();
+        self.replay_cutoff_generations.clear();
     }
 }
 
@@ -28838,7 +31559,13 @@ struct PyDialogEventWaiter {
 struct PyConsoleEventWaiter {
     browser: Arc<BrowserInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
+    event_log: Arc<Mutex<CdpEventLog>>,
     session_id: String,
+    event_cursor: Mutex<u64>,
+    replay_until: HashMap<String, u64>,
+    event_kind: String,
+    page: Option<Arc<PageInner>>,
+    page_state: Mutex<Option<PageEventStreamState>>,
 }
 
 #[cfg(feature = "python")]
@@ -28889,8 +31616,10 @@ struct PyPopupEventWaiter {
 #[pyclass(name = "_WorkerEventWaiter")]
 struct PyWorkerEventWaiter {
     browser: Arc<BrowserInner>,
+    page: Arc<PageInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
-    opener_target_id: String,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    event_cursor: Mutex<u64>,
 }
 
 #[cfg(feature = "python")]
@@ -28898,6 +31627,8 @@ struct PyWorkerEventWaiter {
 struct PyWorkerCloseEventWaiter {
     browser: Arc<BrowserInner>,
     receiver: Mutex<Option<broadcast::Receiver<Value>>>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    event_cursor: Mutex<u64>,
     target_id: String,
     session_id: String,
 }
@@ -30549,6 +33280,12 @@ async fn wait_for_drag_intercepted(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DragOutcome {
+    InterceptedDrop,
+    NoInterceptedDrop,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_drag_with_cleanup<Start, Complete, Completion>(
     client: &CdpClient,
@@ -30563,7 +33300,7 @@ async fn run_drag_with_cleanup<Start, Complete, Completion>(
 where
     Start: Future<Output = RwResult<Option<Value>>>,
     Complete: FnOnce(Option<Value>) -> Completion,
-    Completion: Future<Output = RwResult<()>>,
+    Completion: Future<Output = RwResult<DragOutcome>>,
 {
     const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -30580,28 +33317,31 @@ where
         Ok(drag_data) => complete(drag_data).await,
         Err(error) => Err(error),
     };
-    if let Err(error) = client
-        .send(
-            "Input.dispatchMouseEvent",
-            mouse_event_payload(
-                "mouseReleased",
-                release_x,
-                release_y,
-                "left",
-                0,
-                1,
-                modifiers,
-            ),
-            Some(pointer_session_id),
-            CLEANUP_TIMEOUT,
-        )
-        .await
-    {
-        eprintln!(
-            "rustwright: mouse release cleanup received no confirmation after committed drag: {error}"
-        );
+    let release_mouse = !matches!(result, Ok(DragOutcome::InterceptedDrop));
+    if release_mouse {
+        if let Err(error) = client
+            .send(
+                "Input.dispatchMouseEvent",
+                mouse_event_payload(
+                    "mouseReleased",
+                    release_x,
+                    release_y,
+                    "left",
+                    0,
+                    1,
+                    modifiers,
+                ),
+                Some(pointer_session_id),
+                CLEANUP_TIMEOUT,
+            )
+            .await
+        {
+            eprintln!(
+                "rustwright: mouse release cleanup received no confirmation after committed drag: {error}"
+            );
+        }
     }
-    result
+    result.map(|_| ())
 }
 
 const PHYSICAL_DRAG_STEPS: u32 = 10;
@@ -30663,7 +33403,8 @@ async fn dispatch_physical_drag_sequence_in_session(
                 modifiers,
                 deadline,
             )
-            .await
+            .await?;
+            Ok(DragOutcome::NoInterceptedDrop)
         },
     )
     .await
@@ -31141,6 +33882,7 @@ fn evaluate_expression_for_frame(
     let session_id = page.session_for_frame_id(&frame_id)?;
     let realm_identity = format!("frame:{frame_id}");
     browser.block_on(async move {
+        enable_console_capture_for_session_if_requested(&page, &session_id, timeout).await?;
         let world = client
             .send(
                 "Page.createIsolatedWorld",
@@ -33298,10 +36040,12 @@ impl Drop for FrameAttachmentLockLease {
         let Some(page) = self.page.upgrade() else {
             return;
         };
-        page.frame_state
-            .lock()
-            .unwrap()
-            .reclaim_attachment_lock(&self.frame_id, &self.attachment_lock);
+        let _ = with_live_page_retention(&page, || {
+            page.frame_state
+                .lock()
+                .unwrap()
+                .reclaim_attachment_lock(&self.frame_id, &self.attachment_lock);
+        });
     }
 }
 
@@ -33362,14 +36106,18 @@ async fn attach_iframe_target_for_frame(
         let Some(session_id) = attached.get("sessionId").and_then(Value::as_str) else {
             return Ok(None);
         };
-        let expected_session = match claim_manual_attached_iframe_session(
+        let Some(claim) = claim_manual_attached_iframe_session(
             &page,
             frame_id,
             parent_frame_id,
             session_id,
             target_name,
             target_url,
-        ) {
+        ) else {
+            detach_session_best_effort(Arc::clone(&page.browser), session_id.to_string());
+            return Err(RwError::TargetClosed(TargetClosedKind::Page));
+        };
+        let expected_session = match claim {
             FrameSessionOwnershipClaim::Claimed(pin) => {
                 spawn_attached_iframe_session_initialization(
                     &page,
@@ -33626,7 +36374,7 @@ async fn wait_for_frame_session(
     expected_session: Option<FrameSessionPin>,
     deadline: OperationDeadline,
 ) -> RwResult<Option<String>> {
-    let (mut updates, mut expected_session) = {
+    let Some((mut updates, mut expected_session)) = with_live_page_retention(page, || {
         let mut state = page.frame_state.lock().unwrap();
         let expected_session = expected_session.or_else(|| {
             state
@@ -33637,6 +36385,8 @@ async fn wait_for_frame_session(
             state.register_frame_session_waiter(frame_id, pin.generation);
         }
         (state.subscribe_session_updates(), expected_session)
+    }) else {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
     };
     let mut _waiter_registration =
         expected_session
@@ -33647,7 +36397,7 @@ async fn wait_for_frame_session(
                 generation: pin.generation,
             });
     loop {
-        let outcome = {
+        let Some(outcome) = with_live_page_retention(page, || {
             let mut state = page.frame_state.lock().unwrap();
             if expected_session.is_none() {
                 if let Some(pin) = state
@@ -33677,6 +36427,8 @@ async fn wait_for_frame_session(
                     .routable_session_pin_for_frame(frame_id, different_from_session_id)
                     .map(|pin| Ok(Some(pin.session_id)))
             }
+        }) else {
+            return Err(RwError::TargetClosed(TargetClosedKind::Page));
         };
         if let Some(outcome) = outcome {
             return outcome;
@@ -33702,10 +36454,12 @@ struct FrameSessionWaiterRegistration {
 impl Drop for FrameSessionWaiterRegistration {
     fn drop(&mut self) {
         if let Some(page) = self.page.upgrade() {
-            page.frame_state
-                .lock()
-                .unwrap()
-                .unregister_frame_session_waiter(&self.frame_id, self.generation);
+            let _ = with_live_page_retention(&page, || {
+                page.frame_state
+                    .lock()
+                    .unwrap()
+                    .unregister_frame_session_waiter(&self.frame_id, self.generation);
+            });
         }
     }
 }
@@ -33800,6 +36554,129 @@ async fn resolve_screenshot_clip(
     }))
 }
 
+const NAVIGATION_HISTORY_TIMEOUT: Duration = Duration::from_millis(250);
+
+async fn retain_navigation_response_bodies_async(
+    client: &CdpClient,
+    session_id: &str,
+    request_ids: &[String],
+) -> Value {
+    let mut retained = serde_json::Map::new();
+    for request_id in request_ids {
+        if request_id.is_empty() {
+            continue;
+        }
+        if let Ok(body) = client
+            .send(
+                "Network.getResponseBody",
+                json!({ "requestId": request_id }),
+                Some(session_id),
+                NAVIGATION_HISTORY_TIMEOUT,
+            )
+            .await
+        {
+            retained.insert(request_id.clone(), body);
+        }
+    }
+    Value::Object(retained)
+}
+
+fn navigation_history_expression(
+    console_buffer_name: &str,
+    page_error_buffer_name: &str,
+) -> String {
+    let console_name =
+        serde_json::to_string(console_buffer_name).unwrap_or_else(|_| "\"\"".to_string());
+    let page_error_name =
+        serde_json::to_string(page_error_buffer_name).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+          const drain = (owner, name) => {{
+            try {{
+              const history = owner && owner[name];
+              if (!Array.isArray(history) || history.length === 0) return [];
+              return history.splice(0, history.length);
+            }} catch (_) {{
+              return [];
+            }}
+          }};
+          return {{
+            console: drain(typeof console === "undefined" ? null : console, {console_name}),
+            page_errors: drain(typeof window === "undefined" ? null : window, {page_error_name})
+          }};
+        }})()"#
+    )
+}
+
+async fn drain_navigation_history_async(
+    client: &CdpClient,
+    session_id: &str,
+    console_buffer_name: &str,
+    page_error_buffer_name: &str,
+) -> Value {
+    let result = client
+        .send(
+            "Runtime.evaluate",
+            json!({
+                "expression": navigation_history_expression(
+                    console_buffer_name,
+                    page_error_buffer_name,
+                ),
+                "awaitPromise": false,
+                "returnByValue": true,
+                "userGesture": true,
+            }),
+            Some(session_id),
+            NAVIGATION_HISTORY_TIMEOUT,
+        )
+        .await;
+    match result
+        .as_ref()
+        .ok()
+        .and_then(|value| runtime_result_to_json(value).ok())
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+    {
+        Some(Value::Object(history)) => Value::Object(history),
+        _ => json!({ "console": [], "page_errors": [] }),
+    }
+}
+
+async fn prepare_navigation_async(
+    page: &Arc<PageInner>,
+    console_buffer_name: &str,
+    page_error_buffer_name: &str,
+    request_ids: Vec<String>,
+) -> RwResult<Value> {
+    let client = Arc::clone(&page.browser.client);
+    let session_id = page.session_id.clone();
+    let response_bodies =
+        retain_navigation_response_bodies_async(&client, &session_id, &request_ids).await;
+    let history = drain_navigation_history_async(
+        &client,
+        &session_id,
+        console_buffer_name,
+        page_error_buffer_name,
+    )
+    .await;
+    let mut payload = match history {
+        Value::Object(history) => history,
+        _ => serde_json::Map::new(),
+    };
+    payload.insert("response_bodies".to_string(), response_bodies);
+    Ok(Value::Object(payload))
+}
+
+fn parse_navigation_request_ids(request_ids_json: Option<&str>) -> RwResult<Vec<String>> {
+    match request_ids_json {
+        None => Ok(Vec::new()),
+        Some(value) if value.trim().is_empty() => Ok(Vec::new()),
+        Some(value) => {
+            let request_ids = serde_json::from_str::<Vec<String>>(value)?;
+            Ok(request_ids)
+        }
+    }
+}
+
 async fn page_goto_async(
     page: Arc<PageInner>,
     url: String,
@@ -33836,7 +36713,7 @@ async fn page_goto_async(
                 started_at,
             )
             .await;
-            return Err(error);
+            return Err(normalize_navigation_timeout(error, deadline));
         }
         Err(error) => return Err(error),
     };
@@ -33865,10 +36742,10 @@ async fn page_goto_async(
     }
     let navigation_frame_id = match navigation_frame_id {
         Some(frame_id) => frame_id,
-        None => {
-            page.main_frame_id(&client, &session_id, deadline.remaining()?)
-                .await?
-        }
+        None => page
+            .main_frame_id(&client, &session_id, deadline.remaining()?)
+            .await
+            .map_err(|error| normalize_navigation_timeout(error, deadline))?,
     };
     let response = match wait_for_navigation(
         &client,
@@ -33902,7 +36779,7 @@ async fn page_goto_async(
                 started_at,
             )
             .await;
-            return Err(error);
+            return Err(normalize_navigation_timeout(error, deadline));
         }
         Err(error) => return Err(error),
     };
@@ -33947,7 +36824,9 @@ async fn page_goto_observed_async(
     timeout: Duration,
     referer: Option<String>,
 ) -> RwResult<NavigationObservation> {
-    page_goto_observed_impl(page, url, wait_until, timeout, referer).await
+    page_goto_observed_impl(page, url, wait_until, timeout, referer)
+        .await
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
 }
 
 async fn page_goto_observed_impl(
@@ -34092,6 +36971,18 @@ async fn page_reload_observed_async(
     wait_until: String,
     timeout: Duration,
 ) -> RwResult<NavigationObservation> {
+    page_reload_observed_impl(page, client, session_id, wait_until, timeout)
+        .await
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
+}
+
+async fn page_reload_observed_impl(
+    page: Arc<PageInner>,
+    client: Arc<CdpClient>,
+    session_id: String,
+    wait_until: String,
+    timeout: Duration,
+) -> RwResult<NavigationObservation> {
     let deadline = OperationDeadline::new(timeout);
     let expected_frame_id = page
         .main_frame_id(&client, &session_id, deadline.remaining()?)
@@ -34150,6 +37041,19 @@ async fn page_reload_observed_async(
 }
 
 async fn page_history_observed_async(
+    page: Arc<PageInner>,
+    client: Arc<CdpClient>,
+    session_id: String,
+    offset: i64,
+    wait_until: String,
+    timeout: Duration,
+) -> RwResult<HistoryNavigationObservation> {
+    page_history_observed_impl(page, client, session_id, offset, wait_until, timeout)
+        .await
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
+}
+
+async fn page_history_observed_impl(
     page: Arc<PageInner>,
     client: Arc<CdpClient>,
     session_id: String,
@@ -34753,78 +37657,6 @@ async fn element_handle_wait_for_selector_async(
     )
     .await?;
     wait_for_selector_result(&json, timeout)
-}
-
-fn locator_action_body(action: &str, strict: bool, timeout: Duration) -> String {
-    let strict_json = if strict { "true" } else { "false" };
-    let timeout_millis = timeout.as_millis().max(1);
-    format!(
-        r#"
-const strict = {strict_json};
-const timeoutMs = {timeout_millis};
-const attempt = () => {{
-  const currentMatches = all(spec);
-  if (strict && currentMatches.length > 1) return {{ done: true, value: `__rustwright_strict_violation__:${{currentMatches.length}}` }};
-  const current = currentMatches[index] || null;
-  if (!current || !visible(current) || current.disabled) return {{ done: false }};
-  const el = current;
-  {action}
-  return {{ done: true, value: true }};
-}};
-const first = attempt();
-if (first.done) return first.value;
-return new Promise(resolve => {{
-  let settled = false;
-  let observer = null;
-  let interval = null;
-  let timer = null;
-  const finish = value => {{
-    if (settled) return;
-    settled = true;
-    if (observer) observer.disconnect();
-    if (interval) clearInterval(interval);
-    if (timer) clearTimeout(timer);
-    resolve(value);
-  }};
-  const check = () => {{
-    const next = attempt();
-    if (next.done) finish(next.value);
-  }};
-  observer = new MutationObserver(check);
-  observer.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }});
-  interval = setInterval(check, 5);
-  timer = setTimeout(() => finish('__rustwright_timeout__'), timeoutMs);
-}});
-"#
-    )
-}
-
-async fn page_locator_action_async(
-    page: Arc<PageInner>,
-    locator_json: String,
-    index: usize,
-    action: String,
-    timeout: Duration,
-    strict: bool,
-    method: &'static str,
-) -> RwResult<()> {
-    let body = locator_action_body(&action, strict, timeout);
-    let eval_timeout = Duration::from_millis(timeout.as_millis().saturating_add(1_000) as u64);
-    let json = evaluate_locator_for_page(page, locator_json, index, body, eval_timeout).await?;
-    let value = serde_json::from_str::<Value>(&json).unwrap_or(Value::Null);
-    if value.as_str() == Some("__rustwright_timeout__") {
-        return Err(RwError::Timeout(timeout.as_millis() as u64));
-    }
-    if let Some(count) = value
-        .as_str()
-        .and_then(|text| text.strip_prefix("__rustwright_strict_violation__:"))
-        .and_then(|text| text.parse::<u64>().ok())
-    {
-        return Err(RwError::Message(format!(
-            "strict mode violation: locator resolved to {count} elements while trying to {method}"
-        )));
-    }
-    Ok(())
 }
 
 fn native_action_body(template: &str) -> String {
@@ -35694,6 +38526,7 @@ async fn page_close_cleanup(
         Arc::as_ptr(&page),
     );
     page.close_target_on_drop.store(false, Ordering::SeqCst);
+    page.release_memory_buffers();
     Ok(())
 }
 
@@ -35704,6 +38537,7 @@ async fn page_close_async(
 ) -> RwResult<()> {
     let lifecycle = Arc::clone(&page.lifecycle);
     single_flight_close(lifecycle, false, move || async move {
+        page.clear_worker_resume_handoffs();
         page.abort_iframe_setup_tasks();
         page_close_cleanup(page, timeout, run_before_unload).await
     })
@@ -35884,6 +38718,10 @@ async fn dispatch_mouse_click_async(
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyPage {
+    fn event_cursor(&self) -> u64 {
+        self.inner.browser.client.event_cursor()
+    }
+
     fn background_override_active(&self) -> bool {
         self.inner.background_override_active.load(Ordering::SeqCst)
     }
@@ -35909,7 +38747,6 @@ impl PyPage {
         .to_string()
     }
 
-    #[pyo3(signature = (url, wait_until=None, timeout_ms=None, referer=None))]
     fn goto_async(
         &self,
         py: Python<'_>,
@@ -35949,40 +38786,6 @@ impl PyPage {
             runtime,
             evaluate_expression_for_page_async(page, expression, timeout),
             |py, value| Ok(value.into_pyobject(py)?.unbind().into_any()),
-        )
-    }
-
-    #[pyo3(signature = (locator_json, index, timeout_ms=None, strict=false))]
-    fn click_async(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        timeout_ms: Option<f64>,
-        strict: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let page = Arc::clone(&self.inner);
-        let runtime = page.browser.runtime.handle().clone();
-        let timeout = BrowserInner::command_timeout(timeout_ms);
-        let action = r#"
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-el.click();
-"#
-        .to_string();
-        python_future_on(
-            py,
-            runtime,
-            page_locator_action_async(
-                page,
-                locator_json.to_string(),
-                index,
-                action,
-                timeout,
-                strict,
-                "click",
-            ),
-            |py, ()| Ok(py.None()),
         )
     }
 
@@ -36036,36 +38839,6 @@ el.click();
                 initial_buttons,
                 modifiers,
                 remaining_ms,
-            ),
-            |py, ()| Ok(py.None()),
-        )
-    }
-
-    #[pyo3(signature = (locator_json, index, value, timeout_ms=None, strict=false))]
-    fn fill_async(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        value: &str,
-        timeout_ms: Option<f64>,
-        strict: bool,
-    ) -> PyResult<Py<PyAny>> {
-        let page = Arc::clone(&self.inner);
-        let runtime = page.browser.runtime.handle().clone();
-        python_future_on(
-            py,
-            runtime,
-            page_fill_actionable_async(
-                page,
-                locator_json.to_string(),
-                index,
-                value.to_string(),
-                timeout_ms,
-                strict,
-                false,
-                "fill".to_string(),
-                None,
             ),
             |py, ()| Ok(py.None()),
         )
@@ -36703,8 +39476,10 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                                             deadline.remaining()?,
                                         )
                                         .await?;
+                                    Ok(DragOutcome::InterceptedDrop)
+                                } else {
+                                    Ok(DragOutcome::NoInterceptedDrop)
                                 }
-                                Ok(())
                             },
                         )
                         .await?;
@@ -36780,6 +39555,33 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 modifiers,
                 timeout,
             ))
+        })
+        .map_err(py_err)
+    }
+
+    #[pyo3(signature = (console_buffer_name, page_error_buffer_name, response_request_ids_json=None))]
+    fn prepare_navigation(
+        &self,
+        py: Python<'_>,
+        console_buffer_name: &str,
+        page_error_buffer_name: &str,
+        response_request_ids_json: Option<&str>,
+    ) -> PyResult<String> {
+        let request_ids =
+            parse_navigation_request_ids(response_request_ids_json).map_err(py_err)?;
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let console_buffer_name = console_buffer_name.to_string();
+        let page_error_buffer_name = page_error_buffer_name.to_string();
+        py.detach(move || {
+            browser
+                .block_on(prepare_navigation_async(
+                    &page,
+                    &console_buffer_name,
+                    &page_error_buffer_name,
+                    request_ids,
+                ))
+                .map(|payload| payload.to_string())
         })
         .map_err(py_err)
     }
@@ -36895,6 +39697,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                     .to_string())
             })
         })
+        .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
         .map_err(py_err)
     }
 
@@ -37917,6 +40720,7 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
                 }
                 Ok(Value::Null.to_string())
             })
+            .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
             .map_err(py_err)
     }
 
@@ -37930,34 +40734,6 @@ return win.__rustwrightCleanupDrag ? win.__rustwrightCleanupDrag() : false;
         self.navigate_history(1, wait_until, timeout_ms)
     }
 
-    #[pyo3(signature = (locator_json, index, timeout_ms=None))]
-    fn click(
-        &self,
-        py: Python<'_>,
-        locator_json: &str,
-        index: usize,
-        timeout_ms: Option<f64>,
-    ) -> PyResult<()> {
-        let prepare_body = r#"
-if (!el) throw new Error('No element matches locator');
-el.scrollIntoView({ block: 'center', inline: 'center' });
-if (typeof el.focus === 'function') el.focus({ preventScroll: true });
-return { ready: true, result: true, payload: null };
-"#;
-        let dispatch_body = "if (!el.isConnected) throw new Error('__rustwright_action_dispatch_not_started__: element detached'); rustwrightCommitDispatch(true); el.click(); return true;";
-        py.detach(|| {
-            self.evaluate_locator_dispatch(
-                locator_json,
-                index,
-                prepare_body,
-                dispatch_body,
-                timeout_ms,
-            )
-        })
-        .map(|_| ())
-        .map_err(py_err)
-    }
-
     #[pyo3(signature = (locator_json, index, body, timeout_ms=None))]
     fn locator_eval(
         &self,
@@ -37967,11 +40743,10 @@ return { ready: true, result: true, payload: null };
         body: &str,
         timeout_ms: Option<f64>,
     ) -> PyResult<String> {
-        // Release the GIL for the duration of the blocking CDP round-trip, matching
-        // `click` and `locator_eval_handle`. `evaluate_locator` already detaches inside
-        // `block_on`, but keeping the detach explicit at the binding layer keeps the
-        // three locator bindings consistent and guards against a future refactor that
-        // adds GIL-holding work before `block_on` or changes the transport.
+        // Release the GIL for the blocking CDP round-trip, as
+        // `locator_eval_handle` does. `evaluate_locator` already detaches inside
+        // `block_on`, but an explicit binding-layer detach prevents a future
+        // refactor from adding GIL-holding work before `block_on`.
         py.detach(|| self.evaluate_locator(locator_json, index, body, timeout_ms))
             .map_err(py_err)
     }
@@ -38114,211 +40889,12 @@ return { ready: true, result: true, payload: null };
         else {
             return Ok(json!({ "ok": false, "type": "not-applicable" }).to_string());
         };
-        let fill_options = if matches!(operation, "css_fill" | "label_fill" | "placeholder_fill") {
-            let args = serde_json::from_str::<Value>(args_json)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            Some((
-                args.get("value")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        PyValueError::new_err("locator fast fill value must be a string")
-                    })?
-                    .to_string(),
-                args.get("strict").and_then(Value::as_bool).unwrap_or(false),
-            ))
-        } else {
-            None
-        };
         let page = Arc::clone(&self.inner);
         let locator_json = locator_json.to_string();
         let wait_probe = operation == "css_immediate_state";
         let timeout = BrowserInner::command_timeout(timeout_ms);
         py.detach(move || {
-            if let Some((value, strict)) = fill_options {
-                let guard_key = script.fill_guard_key.ok_or_else(|| {
-                    RwError::Message("fast fill did not return a fill guard key".to_string())
-                })?;
-                let fill_script = LocatorFillScript {
-                    body: script.body,
-                    guard_key,
-                };
-                let browser = Arc::clone(&page.browser);
-                browser.block_on(async move {
-                    let deadline = action_deadline(timeout);
-                    let mut pinned_resolution = None;
-                    let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
-                    let evaluation = evaluate_locator_fill_for_page(
-                        Arc::clone(&page),
-                        locator_json.clone(),
-                        index,
-                        fill_script.body.clone(),
-                        fill_script.guard_key.clone(),
-                        value.clone(),
-                        timeout,
-                        &mut pinned_resolution,
-                        &mut current_attempt_evidence,
-                        None,
-                    )
-                    .await;
-                    let mut json = match evaluation {
-                        Ok(json) => json,
-                        Err(error) if error.is_retryable_timeout() => {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let first_result =
-                        decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
-                    let first_info = first_result
-                        .get("info")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let first_result_type = first_result.get("type").and_then(Value::as_str);
-                    let first_result_succeeded =
-                        first_result.get("ok").and_then(Value::as_bool) == Some(true);
-                    if !first_result_succeeded
-                        && !matches!(
-                            first_result_type,
-                            Some("observe-dispatch" | "pending-dispatch")
-                        )
-                    {
-                        if let Some(error) = strict_violation_error(&first_info, strict, "fill") {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                    }
-                    match classify_fill_attempt(&first_result, "fill")? {
-                        FillAttempt::Success | FillAttempt::PendingActionability => {
-                            return Ok(json);
-                        }
-                        FillAttempt::PendingDispatch => {}
-                    }
-                    let mut last_info = first_info;
-                    let mut last_info_json = json;
-                    let mut last_timeout_state = "confirmed as edited";
-                    let mut last_attempt_evidence = FillAttemptEvidence::SettleWritten;
-                    loop {
-                        if Instant::now() >= deadline {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(ActionTimeoutError::from_attempt_raw_json(
-                                last_timeout_state,
-                                "fill".to_string(),
-                                last_info_json,
-                                &last_info,
-                                Some("info"),
-                                last_attempt_evidence,
-                            )
-                            .into());
-                        }
-                        tokio::time::sleep(
-                            deadline
-                                .saturating_duration_since(Instant::now())
-                                .min(Duration::from_millis(20)),
-                        )
-                        .await;
-                        if let Err(error) = ensure_native_action_owner_available(&page, "fill") {
-                            let _ = cleanup_retained_fill_guard(
-                                Arc::clone(&page),
-                                &locator_json,
-                                &fill_script.guard_key,
-                                pinned_resolution.as_ref(),
-                                Duration::from_millis(100),
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        let mut current_attempt_evidence = FillAttemptEvidence::Resolve;
-                        let evaluation = evaluate_locator_fill_for_page(
-                            Arc::clone(&page),
-                            locator_json.clone(),
-                            index,
-                            fill_script.body.clone(),
-                            fill_script.guard_key.clone(),
-                            value.clone(),
-                            remaining.max(Duration::from_millis(1)),
-                            &mut pinned_resolution,
-                            &mut current_attempt_evidence,
-                            None,
-                        )
-                        .await;
-                        json = match evaluation {
-                            Ok(json) => json,
-                            Err(error) if error.is_retryable_timeout() => {
-                                last_attempt_evidence = current_attempt_evidence;
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let result =
-                            decode_runtime_serialized_value(serde_json::from_str::<Value>(&json)?);
-                        let info = result.get("info").cloned().unwrap_or_else(|| json!({}));
-                        let result_type = result.get("type").and_then(Value::as_str);
-                        let result_succeeded =
-                            result.get("ok").and_then(Value::as_bool) == Some(true);
-                        if !result_succeeded
-                            && !matches!(result_type, Some("observe-dispatch" | "pending-dispatch"))
-                        {
-                            if let Some(error) = strict_violation_error(&info, strict, "fill") {
-                                let _ = cleanup_retained_fill_guard(
-                                    Arc::clone(&page),
-                                    &locator_json,
-                                    &fill_script.guard_key,
-                                    pinned_resolution.as_ref(),
-                                    Duration::from_millis(100),
-                                )
-                                .await;
-                                return Err(error);
-                            }
-                        }
-                        match classify_fill_attempt(&result, "fill")? {
-                            FillAttempt::Success => return Ok(json),
-                            FillAttempt::PendingActionability | FillAttempt::PendingDispatch => {
-                                let pending_dispatch = result_type == Some("pending-dispatch");
-                                last_attempt_evidence = if pending_dispatch {
-                                    debug_assert_eq!(
-                                        current_attempt_evidence,
-                                        FillAttemptEvidence::SettleWritten
-                                    );
-                                    FillAttemptEvidence::SettleWritten
-                                } else {
-                                    pinned_resolution.take();
-                                    FillAttemptEvidence::Resolve
-                                };
-                                last_timeout_state = if pending_dispatch {
-                                    "confirmed as edited"
-                                } else {
-                                    "editable"
-                                };
-                                last_info = info;
-                                last_info_json = json;
-                            }
-                        }
-                    }
-                })
-            } else if wait_probe {
+            if wait_probe {
                 let expression = locator_script(&locator_json, index, &script.body);
                 evaluate_locator_wait_probe_for_page(page, expression, timeout_ms)
             } else {
@@ -38401,31 +40977,6 @@ return { ready: true, result: true, payload: null };
             ))
         })
         .map_err(py_err)
-    }
-
-    #[pyo3(signature = (locator_json, index, value, timeout_ms=None))]
-    fn fill(
-        &self,
-        locator_json: &str,
-        index: usize,
-        value: &str,
-        timeout_ms: Option<f64>,
-    ) -> PyResult<()> {
-        let page = Arc::clone(&self.inner);
-        let browser = Arc::clone(&page.browser);
-        browser
-            .block_on(page_fill_actionable_async(
-                page,
-                locator_json.to_string(),
-                index,
-                value.to_string(),
-                timeout_ms,
-                false,
-                false,
-                "fill".to_string(),
-                None,
-            ))
-            .map_err(py_err)
     }
 
     #[pyo3(signature = (locator_json, index, text, timeout_ms=None))]
@@ -38827,6 +41378,7 @@ return { ready: true, result: true, payload: null };
                 let client = Arc::clone(&self.inner.browser.client);
                 Ok(PyNetworkEventWaiter {
                     browser: Arc::clone(&self.inner.browser),
+                    page: Arc::clone(&self.inner),
                     receiver: Mutex::new(Some(client.subscribe())),
                     event_log: Arc::clone(&client.event_log),
                     cursor: Mutex::new(client.event_cursor()),
@@ -38860,7 +41412,7 @@ return { ready: true, result: true, payload: null };
             cursor: Arc::new(Mutex::new(cursor)),
             session_id: page.session_id.clone(),
             requests: Arc::clone(&page.network_requests),
-            state: Arc::new(Mutex::new(Some(PageEventStreamState::new()))),
+            state: Arc::new(Mutex::new(Some(PageEventStreamState::for_page(&page)))),
             pending_batch: Arc::new(Mutex::new(None)),
             close_tx,
             closed: Arc::new(AtomicBool::new(false)),
@@ -38892,16 +41444,55 @@ return { ready: true, result: true, payload: null };
         }
     }
 
-    fn console_event_waiter(&self) -> PyResult<PyConsoleEventWaiter> {
+    #[pyo3(signature = (timeout_ms=None))]
+    fn console_event_waiter(&self, timeout_ms: Option<f64>) -> PyResult<PyConsoleEventWaiter> {
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
-        browser
-            .block_on(async move { enable_console_capture(&page, Duration::from_secs(5)).await })
+        let client = Arc::clone(&browser.client);
+        let (receiver, event_cursor, mut page_wait_state) =
+            PageEventStreamState::subscribe_page_event_stream(&page);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let page_for_setup = Arc::clone(&page);
+        let replay_until = browser
+            .block_on(async move { enable_console_capture(&page_for_setup, timeout).await })
             .map_err(py_err)?;
+        page_wait_state.seed_replay_cutoffs(&replay_until);
         Ok(PyConsoleEventWaiter {
             browser: Arc::clone(&self.inner.browser),
-            receiver: Mutex::new(Some(self.inner.browser.client.subscribe())),
+            receiver: Mutex::new(Some(receiver)),
+            event_log: Arc::clone(&client.event_log),
             session_id: self.inner.session_id.clone(),
+            event_cursor: Mutex::new(event_cursor),
+            replay_until,
+            event_kind: "console".to_string(),
+            page: Some(Arc::clone(&self.inner)),
+            page_state: Mutex::new(Some(page_wait_state)),
+        })
+    }
+
+    #[pyo3(signature = (timeout_ms=None))]
+    fn page_error_event_waiter(&self, timeout_ms: Option<f64>) -> PyResult<PyConsoleEventWaiter> {
+        let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let client = Arc::clone(&browser.client);
+        let (receiver, event_cursor, mut page_wait_state) =
+            PageEventStreamState::subscribe_page_event_stream(&page);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let page_for_setup = Arc::clone(&page);
+        let replay_until = browser
+            .block_on(async move { enable_console_capture(&page_for_setup, timeout).await })
+            .map_err(py_err)?;
+        page_wait_state.seed_replay_cutoffs(&replay_until);
+        Ok(PyConsoleEventWaiter {
+            browser: Arc::clone(&self.inner.browser),
+            receiver: Mutex::new(Some(receiver)),
+            event_log: Arc::clone(&client.event_log),
+            session_id: self.inner.session_id.clone(),
+            event_cursor: Mutex::new(event_cursor),
+            replay_until,
+            event_kind: "pageerror".to_string(),
+            page: Some(Arc::clone(&self.inner)),
+            page_state: Mutex::new(Some(page_wait_state)),
         })
     }
 
@@ -39052,34 +41643,114 @@ return { ready: true, result: true, payload: null };
         })
     }
 
-    #[pyo3(signature = (timeout_ms=None))]
-    fn worker_event_waiter(&self, timeout_ms: Option<f64>) -> PyResult<PyWorkerEventWaiter> {
+    #[pyo3(signature = (interested, timeout_ms=None))]
+    fn set_worker_event_interest(&self, interested: bool, timeout_ms: Option<f64>) -> PyResult<()> {
         let page = Arc::clone(&self.inner);
+        let browser = Arc::clone(&page.browser);
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        let sessions = {
+            let mut state = page.frame_state.lock().unwrap();
+            state.set_worker_event_interest(interested);
+            if interested {
+                Vec::new()
+            } else {
+                let worker_sessions = state.worker_sessions.iter().cloned().collect::<Vec<_>>();
+                worker_sessions
+                    .into_iter()
+                    .filter(|session_id| state.take_worker_resume_fallback(session_id))
+                    .collect::<Vec<_>>()
+            }
+        };
+        browser
+            .block_on(async move {
+                for session_id in sessions {
+                    let _ = resume_worker_after_claim(&page, &session_id, timeout).await;
+                }
+                Ok::<_, RwError>(())
+            })
+            .map_err(py_err)
+    }
+    #[pyo3(signature = (interested, timeout_ms=None))]
+    fn set_worker_forwarding_interest(
+        &self,
+        interested: bool,
+        timeout_ms: Option<f64>,
+    ) -> PyResult<()> {
+        let _ = timeout_ms;
+        self.inner
+            .frame_state
+            .lock()
+            .unwrap()
+            .set_worker_forwarding_interest(interested);
+        Ok(())
+    }
+
+    #[pyo3(signature = (timeout_ms=None, configure=true))]
+    fn worker_event_waiter(
+        &self,
+        timeout_ms: Option<f64>,
+        configure: bool,
+    ) -> PyResult<PyWorkerEventWaiter> {
+        let page = Arc::clone(&self.inner);
+        page.frame_state
+            .lock()
+            .unwrap()
+            .set_worker_event_interest(true);
         let timeout = BrowserInner::command_timeout(timeout_ms);
         let browser = Arc::clone(&page.browser);
         let client = Arc::clone(&browser.client);
         let session_id = page.session_id.clone();
-        browser
-            .block_on(async move {
-                client
-                    .send(
-                        "Target.setAutoAttach",
-                        json!({
-                            "autoAttach": true,
-                            "waitForDebuggerOnStart": false,
-                            "flatten": true,
-                        }),
-                        Some(&session_id),
-                        timeout,
+        let (receiver, event_cursor) = client.subscribe_with_cursor();
+        let setup_auto_attach_lock = page
+            .iframe_setup_tasks
+            .auto_attach_lock_for_session(&session_id);
+        if configure {
+            let owned_sessions = {
+                let state = page.frame_state.lock().unwrap();
+                state.all_owned_session_ids()
+            };
+            let child_auto_attach_locks = owned_sessions
+                .iter()
+                .filter(|child_session_id| *child_session_id != &session_id)
+                .map(|child_session_id| {
+                    (
+                        child_session_id.clone(),
+                        page.iframe_setup_tasks
+                            .auto_attach_lock_for_session(child_session_id),
                     )
-                    .await?;
-                Ok(())
-            })
-            .map_err(py_err)?;
+                })
+                .collect::<Vec<_>>();
+            let setup_client = Arc::clone(&client);
+            let setup_page = Arc::clone(&page);
+            let setup_session_id = session_id.clone();
+            browser
+                .block_on(async move {
+                    {
+                        let _auto_attach_guard = setup_auto_attach_lock.lock().await;
+                        enable_worker_auto_attach(&setup_client, &setup_session_id, timeout)
+                            .await?;
+                    }
+                    setup_page
+                        .frame_state
+                        .lock()
+                        .unwrap()
+                        .mark_worker_auto_attach_requested();
+                    for (child_session_id, auto_attach_lock) in child_auto_attach_locks {
+                        let _auto_attach_guard = auto_attach_lock.lock().await;
+                        let _ =
+                            enable_worker_auto_attach(&setup_client, &child_session_id, timeout)
+                                .await;
+                    }
+                    Ok::<_, RwError>(())
+                })
+                .map_err(py_err)?;
+        }
         Ok(PyWorkerEventWaiter {
-            browser: Arc::clone(&self.inner.browser),
-            receiver: Mutex::new(Some(self.inner.browser.client.subscribe())),
-            opener_target_id: self.inner.target_id.clone(),
+            browser: Arc::clone(&page.browser),
+            page,
+            receiver: Mutex::new(Some(receiver)),
+            event_log: Arc::clone(&client.event_log),
+            event_cursor: Mutex::new(event_cursor),
         })
     }
 
@@ -39088,11 +41759,17 @@ return { ready: true, result: true, payload: null };
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
         let browser_for_task = Arc::clone(&browser);
+        let page_for_task = Arc::clone(&page);
         let client = Arc::clone(&browser.client);
         let opener_target_id = page.target_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
         browser
             .block_on(async move {
+                if register_page_owned_workers_from_event_log(&page_for_task).await {
+                    return Err(RwError::Message(
+                        "CDP event log contains unreplayable worker history".to_string(),
+                    ));
+                }
                 let result = client
                     .send("Target.getTargets", json!({}), None, timeout)
                     .await?;
@@ -39103,12 +41780,31 @@ return { ready: true, result: true, payload: null };
                     .into_iter()
                     .flatten()
                 {
-                    let target_type = info.get("type").and_then(Value::as_str).unwrap_or("");
-                    if target_type != "worker" {
+                    if info.get("type").and_then(Value::as_str) != Some("worker") {
                         continue;
                     }
                     let opener = info.get("openerId").and_then(Value::as_str);
-                    if opener != Some(opener_target_id.as_str()) {
+                    let opener_owned = opener == Some(opener_target_id.as_str())
+                        || opener.is_some_and(|opener| {
+                            page_for_task
+                                .frame_state
+                                .lock()
+                                .unwrap()
+                                .owns_frame_target(opener)
+                        });
+                    let parent_owned = info
+                        .get("parentId")
+                        .or_else(|| info.get("parentFrameId"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|parent| {
+                            parent == opener_target_id
+                                || page_for_task
+                                    .frame_state
+                                    .lock()
+                                    .unwrap()
+                                    .owns_frame_target(parent)
+                        });
+                    if !opener_owned && !parent_owned {
                         continue;
                     }
                     let Some(target_id) = info.get("targetId").and_then(Value::as_str) else {
@@ -39119,14 +41815,39 @@ return { ready: true, result: true, payload: null };
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
+                    let attached = info
+                        .get("attached")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if attached {
+                        let existing_session_id = page_for_task
+                            .frame_state
+                            .lock()
+                            .unwrap()
+                            .worker_session_for_target(target_id);
+                        if let Some(session_id) = existing_session_id {
+                            workers.push(PyWorker {
+                                browser: Arc::clone(&browser_for_task),
+                                page: Some(Arc::clone(&page_for_task)),
+                                target_id: target_id.to_string(),
+                                session_id,
+                                url,
+                            });
+                            continue;
+                        }
+                    }
                     if let Ok(worker) = attach_existing_worker(
                         Arc::clone(&browser_for_task),
+                        Some(Arc::clone(&page_for_task)),
                         target_id.to_string(),
                         url,
                         timeout,
                     )
                     .await
                     {
+                        let mut state = page_for_task.frame_state.lock().unwrap();
+                        state.record_worker_session(&worker.session_id);
+                        state.associate_worker_target_session(target_id, &worker.session_id);
                         workers.push(worker);
                     }
                 }
@@ -39467,6 +42188,70 @@ impl PyWorker {
     fn target_id(&self) -> String {
         self.target_id.clone()
     }
+    #[getter]
+    fn session_id(&self) -> String {
+        self.session_id.clone()
+    }
+
+    #[pyo3(signature = (timeout_ms=None))]
+    fn run_if_waiting_for_debugger(&self, py: Python<'_>, timeout_ms: Option<f64>) -> PyResult<()> {
+        let browser = Arc::clone(&self.browser);
+        let client = Arc::clone(&browser.client);
+        let page = self.page.clone();
+        let session_id = self.session_id.clone();
+        let timeout = BrowserInner::command_timeout(timeout_ms);
+        py.detach(move || {
+            browser.block_on(async move {
+                if let Some(page) = page.as_ref() {
+                    let should_resume = page
+                        .frame_state
+                        .lock()
+                        .unwrap()
+                        .prepare_worker_resume(&session_id);
+                    if !should_resume {
+                        return Ok(());
+                    }
+                    return resume_worker_after_claim(page, &session_id, timeout).await;
+                }
+                client
+                    .send(
+                        "Runtime.runIfWaitingForDebugger",
+                        json!({}),
+                        Some(&session_id),
+                        timeout,
+                    )
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .map_err(py_err)
+    }
+
+    fn claim_capture_handoff(&self) -> bool {
+        self.page.as_ref().is_some_and(|page| {
+            page.frame_state
+                .lock()
+                .unwrap()
+                .claim_worker_resume_handoff(&self.session_id)
+        })
+    }
+    fn mark_capture_ready(&self) -> bool {
+        self.page.as_ref().is_some_and(|page| {
+            page.frame_state
+                .lock()
+                .unwrap()
+                .mark_worker_capture_ready(&self.session_id)
+        })
+    }
+
+    fn fail_capture_handoff(&self) -> bool {
+        self.page.as_ref().is_some_and(|page| {
+            page.frame_state
+                .lock()
+                .unwrap()
+                .mark_worker_resume_handoff_failed(&self.session_id)
+        })
+    }
 
     #[pyo3(signature = (expression, arg_json=None, timeout_ms=None))]
     fn evaluate(
@@ -39719,9 +42504,13 @@ impl PyWorker {
     }
 
     fn close_event_waiter(&self) -> PyWorkerCloseEventWaiter {
+        let client = &self.browser.client;
+        let (receiver, event_cursor) = client.subscribe_with_cursor();
         PyWorkerCloseEventWaiter {
             browser: Arc::clone(&self.browser),
-            receiver: Mutex::new(Some(self.browser.client.subscribe())),
+            receiver: Mutex::new(Some(receiver)),
+            event_log: Arc::clone(&client.event_log),
+            event_cursor: Mutex::new(event_cursor),
             target_id: self.target_id.clone(),
             session_id: self.session_id.clone(),
         }
@@ -39733,18 +42522,26 @@ impl PyWorker {
         let client = Arc::clone(&browser.client);
         let session_id = self.session_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        browser
+        let (receiver, event_cursor) = client.subscribe_with_cursor();
+        let setup_client = Arc::clone(&client);
+        let setup_session_id = session_id.clone();
+        let replay_until = browser
             .block_on(async move {
-                client
-                    .send("Runtime.enable", json!({}), Some(&session_id), timeout)
-                    .await?;
-                Ok(())
+                enable_runtime_with_local_console_cutoff(&setup_client, &setup_session_id, timeout)
+                    .await
             })
             .map_err(py_err)?;
+        let replay_until = std::iter::once((session_id.clone(), replay_until)).collect();
         Ok(PyConsoleEventWaiter {
             browser: Arc::clone(&self.browser),
-            receiver: Mutex::new(Some(self.browser.client.subscribe())),
+            receiver: Mutex::new(Some(receiver)),
+            event_log: Arc::clone(&client.event_log),
             session_id: self.session_id.clone(),
+            event_cursor: Mutex::new(event_cursor),
+            replay_until,
+            event_kind: "console".to_string(),
+            page: None,
+            page_state: Mutex::new(None),
         })
     }
 }
@@ -39845,6 +42642,7 @@ impl PyNetworkEventWaiter {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("network waiter is already waiting"))?;
         let browser = Arc::clone(&self.browser);
+        let page = Arc::clone(&self.page);
         let session_id = self.session_id.clone();
         let kind = self.kind.clone();
         let requests = Arc::clone(&self.requests);
@@ -39859,6 +42657,7 @@ impl PyNetworkEventWaiter {
                 &session_id,
                 &kind,
                 requests,
+                page,
                 timeout,
             ));
             (result, receiver, cursor)
@@ -39897,7 +42696,11 @@ impl PyPageEventStream {
         let page = Arc::clone(&self.page);
         let browser = Arc::clone(&self.browser);
         browser
-            .block_on(async move { enable_console_capture(&page, Duration::from_secs(5)).await })
+            .block_on(async move {
+                enable_console_capture(&page, Duration::from_secs(5))
+                    .await
+                    .map(|_| ())
+            })
             .map_err(py_err)
     }
 
@@ -39908,7 +42711,11 @@ impl PyPageEventStream {
         python_future_on(
             py,
             runtime,
-            async move { enable_console_capture(&page, Duration::from_secs(5)).await },
+            async move {
+                enable_console_capture(&page, Duration::from_secs(5))
+                    .await
+                    .map(|_| ())
+            },
             |py, ()| Ok(py.None()),
         )
     }
@@ -39949,6 +42756,7 @@ impl PyPageEventStream {
         let mut cursor = *self.cursor.lock().unwrap();
         let session_id = self.session_id.clone();
         let requests = Arc::clone(&self.requests);
+        let page = Arc::clone(&self.page);
         let close_rx = self.close_tx.subscribe();
         let alive_rx = browser.client.alive_tx.subscribe();
         let timeout = BrowserInner::command_timeout(timeout_ms);
@@ -39960,6 +42768,7 @@ impl PyPageEventStream {
                 &session_id,
                 requests,
                 &mut state,
+                page.as_ref(),
                 close_rx,
                 alive_rx,
                 timeout,
@@ -40012,6 +42821,7 @@ impl PyPageEventStream {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("page event stream is already waiting"))?;
         let browser = Arc::clone(&self.browser);
+        let page = Arc::clone(&self.page);
         let runtime = browser.runtime.handle().clone();
         let event_log = Arc::clone(&self.event_log);
         let cursor = *self.cursor.lock().unwrap();
@@ -40032,6 +42842,7 @@ impl PyPageEventStream {
             cursor_slot: Arc::clone(&self.cursor),
             requests: Arc::clone(&self.requests),
             working_requests: Arc::clone(&working_requests),
+            page: Some(Arc::clone(&self.page)),
         };
         let closed = Arc::clone(&self.closed);
         let pending_batch = Arc::clone(&self.pending_batch);
@@ -40046,6 +42857,7 @@ impl PyPageEventStream {
                     &session_id,
                     working_requests,
                     lease.state.as_mut().unwrap(),
+                    page.as_ref(),
                     close_rx,
                     alive_rx,
                     timeout,
@@ -40150,26 +42962,79 @@ impl PyDialogEventWaiter {
 }
 
 #[cfg(feature = "python")]
-#[pymethods]
 impl PyConsoleEventWaiter {
-    #[pyo3(signature = (timeout_ms=None))]
-    fn wait(&self, py: Python<'_>, timeout_ms: Option<f64>) -> PyResult<String> {
+    fn wait_internal(
+        &self,
+        py: Python<'_>,
+        timeout_ms: Option<f64>,
+        event_type: Option<String>,
+        text: Option<String>,
+        exact_text: bool,
+    ) -> PyResult<String> {
         let mut receiver = self
             .receiver
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("console waiter is already waiting"))?;
+        let mut page_state = self.page_state.lock().unwrap().take();
         let browser = Arc::clone(&self.browser);
+        let event_log = Arc::clone(&self.event_log);
         let session_id = self.session_id.clone();
+        let event_cursor = *self.event_cursor.lock().unwrap();
+        let replay_until = self.replay_until.clone();
+        let event_kind = self.event_kind.clone();
+        let page = self.page.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        let (result, receiver) = py.detach(move || {
-            let result =
-                browser.block_on_raw(wait_for_console_event(&mut receiver, &session_id, timeout));
-            (result, receiver)
+        let (result, receiver, event_cursor, page_state) = py.detach(move || {
+            let result = browser.block_on_raw(wait_for_console_event(
+                &mut receiver,
+                event_log,
+                Arc::clone(&browser),
+                &session_id,
+                event_cursor,
+                &replay_until,
+                &event_kind,
+                page,
+                &mut page_state,
+                event_type.as_deref(),
+                text.as_deref(),
+                exact_text,
+                timeout,
+            ));
+            (result, receiver, event_cursor, page_state)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
-        result.map_err(py_err)
+        *self.event_cursor.lock().unwrap() = event_cursor;
+        *self.page_state.lock().unwrap() = page_state;
+        result.0.map_err(py_err)
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyConsoleEventWaiter {
+    #[pyo3(signature = (timeout_ms=None))]
+    fn wait(&self, py: Python<'_>, timeout_ms: Option<f64>) -> PyResult<String> {
+        self.wait_internal(py, timeout_ms, None, None, false)
+    }
+
+    #[pyo3(signature = (timeout_ms=None, event_type=None, text=None, exact_text=false))]
+    fn wait_matching(
+        &self,
+        py: Python<'_>,
+        timeout_ms: Option<f64>,
+        event_type: Option<&str>,
+        text: Option<&str>,
+        exact_text: bool,
+    ) -> PyResult<String> {
+        self.wait_internal(
+            py,
+            timeout_ms,
+            event_type.map(ToString::to_string),
+            text.map(ToString::to_string),
+            exact_text,
+        )
     }
 }
 
@@ -40330,19 +43195,23 @@ impl PyWorkerEventWaiter {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("worker waiter is already waiting"))?;
         let browser = Arc::clone(&self.browser);
-        let opener_target_id = self.opener_target_id.clone();
+        let page = Arc::clone(&self.page);
+        let event_log = Arc::clone(&self.event_log);
+        let event_cursor = *self.event_cursor.lock().unwrap();
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        let (result, receiver) = py.detach(move || {
-            let browser_for_wait = Arc::clone(&browser);
-            let result = browser.block_on_raw(wait_for_worker(
+        let (result, receiver, event_cursor) = py.detach(move || {
+            let (result, event_cursor) = browser.block_on_raw(wait_for_worker(
                 &mut receiver,
-                browser_for_wait,
-                &opener_target_id,
+                event_log,
+                event_cursor,
+                Arc::clone(&browser),
+                page,
                 timeout,
             ));
-            (result, receiver)
+            (result, receiver, event_cursor)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
+        *self.event_cursor.lock().unwrap() = event_cursor;
         result.map_err(py_err)
     }
 }
@@ -40359,19 +43228,24 @@ impl PyWorkerCloseEventWaiter {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("worker close waiter is already waiting"))?;
         let browser = Arc::clone(&self.browser);
+        let event_log = Arc::clone(&self.event_log);
+        let event_cursor = *self.event_cursor.lock().unwrap();
         let target_id = self.target_id.clone();
         let session_id = self.session_id.clone();
         let timeout = BrowserInner::command_timeout(timeout_ms);
-        let (result, receiver) = py.detach(move || {
-            let result = browser.block_on_raw(wait_for_worker_close(
+        let (result, receiver, event_cursor) = py.detach(move || {
+            let (result, event_cursor) = browser.block_on_raw(wait_for_worker_close(
                 &mut receiver,
+                event_log,
+                event_cursor,
                 &target_id,
                 &session_id,
                 timeout,
             ));
-            (result, receiver)
+            (result, receiver, event_cursor)
         });
         *self.receiver.lock().unwrap() = Some(receiver);
+        *self.event_cursor.lock().unwrap() = event_cursor;
         result.map_err(py_err)
     }
 }
@@ -40525,6 +43399,7 @@ impl PyPage {
                 .await?;
                 Ok(response.response.unwrap_or(Value::Null).to_string())
             })
+            .map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
             .map_err(py_err)
     }
 
@@ -40881,8 +43756,7 @@ async fn wait_for_launch_cancellation(cancelled: Arc<AtomicBool>) {
 #[cfg(feature = "python")]
 #[pyfunction]
 fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
-    let options: LaunchOptions = serde_json::from_str(options_json)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let options = parse_python_launch_options(options_json)?;
     let inner = py
         .detach(move || {
             launch_chromium_with_options_cancellation(
@@ -40899,8 +43773,7 @@ fn launch_chromium(py: Python<'_>, options_json: &str) -> PyResult<PyBrowser> {
 #[cfg(feature = "python")]
 #[pyfunction]
 fn launch_chromium_async(py: Python<'_>, options_json: &str) -> PyResult<Py<PyAny>> {
-    let options: LaunchOptions = serde_json::from_str(options_json)
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let options = parse_python_launch_options(options_json)?;
     python_future_on_thread(
         py,
         move |cancelled| {
@@ -41786,7 +44659,7 @@ pub fn rustwright_launch_chromium_with_cancel(
     options_json: &str,
     cancel: Option<&CancelToken>,
 ) -> RwResult<RustwrightBrowser> {
-    let options: LaunchOptions = serde_json::from_str(options_json)?;
+    let options = parse_launch_options(options_json)?;
     let result = match cancel {
         Some(cancel) => launch_chromium_with_options_token(options, cancel.clone()),
         None => launch_chromium_with_options(options),
@@ -42160,6 +45033,11 @@ impl RustwrightPage {
                 }
                 for (sequence, event) in entries {
                     cursor = sequence.saturating_add(1);
+                    if is_unreplayable_cdp_event(&event) {
+                        reset_page_history_after_unreplayable(&page, sequence);
+                        task_queue.record_upstream_drop(1);
+                        continue;
+                    }
                     if let Some(detail) = native_navigation_detail_from_cdp(&page, &event) {
                         // `sequence + 1` uses the same convention as the event
                         // log cursor: all events ingressed before cursor C have
@@ -42213,7 +45091,11 @@ impl RustwrightPage {
     pub fn arm_console_capture(&self) -> RwResult<()> {
         let page = Arc::clone(&self.inner);
         let browser = Arc::clone(&page.browser);
-        browser.block_on(async move { enable_console_capture(&page, Duration::from_secs(5)).await })
+        browser.block_on(async move {
+            enable_console_capture(&page, Duration::from_secs(5))
+                .await
+                .map(|_| ())
+        })
     }
 
     /// Read the page's bounded request/response lifecycle ring.
@@ -42492,7 +45374,7 @@ impl RustwrightPage {
         let session_id = page.session_id.clone();
         let operation_client = Arc::clone(&client);
         let operation_session_id = session_id.clone();
-        browser.block_on_raw(cancelable_navigation(
+        let result = browser.block_on_raw(cancelable_navigation(
             client,
             session_id,
             cancel.cloned(),
@@ -42533,7 +45415,8 @@ impl RustwrightPage {
                 }
                 Ok(Value::Null.to_string())
             },
-        ))
+        ));
+        result.map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
     }
 
     pub fn reload_with_cancel_observed(
@@ -43378,7 +46261,7 @@ return waitForScrollSettle();
         let session_id = page.session_id.clone();
         let operation_client = Arc::clone(&client);
         let operation_session_id = session_id.clone();
-        browser.block_on_raw(cancelable_navigation(
+        let result = browser.block_on_raw(cancelable_navigation(
             client,
             session_id,
             cancel.cloned(),
@@ -43481,7 +46364,8 @@ return waitForScrollSettle();
                 }
                 Ok((true, response.response.unwrap_or(Value::Null).to_string()))
             },
-        ))
+        ));
+        result.map_err(|error| normalize_navigation_timeout(error, OperationDeadline::new(timeout)))
     }
 
     fn evaluate_locator_json(
@@ -45320,6 +48204,7 @@ async fn attach_existing_page_unregistered(
 #[cfg(feature = "python")]
 async fn attach_existing_worker(
     browser: Arc<BrowserInner>,
+    page: Option<Arc<PageInner>>,
     target_id: String,
     url: String,
     timeout: Duration,
@@ -45341,6 +48226,7 @@ async fn attach_existing_worker(
     install_worker_stealth_defaults(&browser.client, &session_id).await?;
     Ok(PyWorker {
         browser,
+        page,
         target_id,
         session_id,
         url,
@@ -45369,6 +48255,31 @@ async fn enable_page_iframe_auto_attach(
         )
         .await?;
     Ok(())
+}
+
+async fn enable_worker_auto_attach(
+    client: &CdpClient,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<()> {
+    client
+        .send(
+            "Target.setAutoAttach",
+            json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true,
+                "filter": [
+                    { "type": "iframe", "exclude": false },
+                    { "type": "worker", "exclude": false },
+                    { "exclude": true },
+                ],
+            }),
+            Some(session_id),
+            timeout,
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn enable_action_dispatch_binding_for_session(
@@ -45468,22 +48379,24 @@ fn claim_manual_attached_iframe_session(
     child_session_id: &str,
     target_name: Option<String>,
     target_url: Option<String>,
-) -> FrameSessionOwnershipClaim {
-    let mut state = page.frame_state.lock().unwrap();
-    match state.claim_manual_session_for_frame(frame_id, child_session_id) {
-        FrameSessionOwnershipClaim::Existing(pin) => FrameSessionOwnershipClaim::Existing(pin),
-        FrameSessionOwnershipClaim::Claimed(pin) => {
-            state.record_frame(
-                frame_id.to_string(),
-                parent_frame_id,
-                None,
-                None,
-                child_session_id.to_string(),
-            );
-            state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
-            FrameSessionOwnershipClaim::Claimed(pin)
+) -> Option<FrameSessionOwnershipClaim> {
+    with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        match state.claim_manual_session_for_frame(frame_id, child_session_id) {
+            FrameSessionOwnershipClaim::Existing(pin) => FrameSessionOwnershipClaim::Existing(pin),
+            FrameSessionOwnershipClaim::Claimed(pin) => {
+                state.record_frame(
+                    frame_id.to_string(),
+                    parent_frame_id,
+                    None,
+                    None,
+                    child_session_id.to_string(),
+                );
+                state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
+                FrameSessionOwnershipClaim::Claimed(pin)
+            }
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -45518,12 +48431,12 @@ fn register_attached_iframe_session_at_sequence(
     event_sequence: Option<u64>,
     timeout: Duration,
 ) -> RwResult<Option<FrameSessionPin>> {
-    let session_pin = {
+    let Some((session_pin, previous_generation)) = with_live_page_retention(&page, || {
         let mut state = page.frame_state.lock().unwrap();
         if !state.owns_session(&parent_session_id)
             || !state.mark_frame_cache_dirty_at_sequence(&parent_session_id, event_sequence)
         {
-            return Ok(None);
+            return None;
         }
         let previous_generation = state
             .session_pin_for_frame(&frame_id)
@@ -45540,13 +48453,15 @@ fn register_attached_iframe_session_at_sequence(
             None,
             child_session_id,
         );
-        drop(state);
-        if previous_generation.is_some_and(|generation| generation != session_pin.generation) {
-            page.iframe_setup_tasks
-                .abort_generations(previous_generation);
-        }
-        session_pin
+        Some((session_pin, previous_generation))
+    })
+    .flatten() else {
+        return Ok(None);
     };
+    if previous_generation.is_some_and(|generation| generation != session_pin.generation) {
+        page.iframe_setup_tasks
+            .abort_generations(previous_generation);
+    }
     spawn_attached_iframe_session_initialization(&page, frame_id, session_pin.clone(), timeout);
     Ok(Some(session_pin))
 }
@@ -45620,78 +48535,369 @@ fn enqueue_focus_emulation(
     })
 }
 
-async fn enable_console_capture(page: &PageInner, timeout: Duration) -> RwResult<()> {
-    page.console_capture.requested.store(true, Ordering::SeqCst);
+async fn clear_console_capture_for_session(page: &PageInner, session_id: &str) {
+    let mut enabled_sessions = page.console_capture.enabled_sessions.lock().await;
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
+    enabled_sessions.remove(session_id);
+    page.console_replay_until_event_cursor
+        .lock()
+        .unwrap()
+        .remove(session_id);
+}
+
+async fn register_page_owned_iframes_from_event_log(page: &PageInner) -> bool {
+    let events = page
+        .browser
+        .client
+        .event_log
+        .lock()
+        .unwrap()
+        .entries_since(0);
+    let Some((detached_sessions, unreplayable_sequence)) = with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        let mut detached_sessions = Vec::new();
+        let mut unreplayable_sequence = None;
+        for (sequence, event) in events {
+            if is_unreplayable_cdp_event(&event) {
+                unreplayable_sequence = Some(sequence);
+                break;
+            }
+            match event.get("method").and_then(Value::as_str) {
+                Some("Target.attachedToTarget") => {
+                    let target_info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
+                    if target_info.get("type").and_then(Value::as_str) != Some("iframe") {
+                        continue;
+                    }
+                    let Some(parent_session_id) = event.get("sessionId").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let Some(child_session_id) =
+                        event.pointer("/params/sessionId").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let Some(frame_id) = target_info.get("targetId").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !state.owns_session(parent_session_id) {
+                        continue;
+                    }
+                    let parent_frame_id = target_info
+                        .get("parentFrameId")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    state.record_session_for_frame_at_sequence(
+                        frame_id,
+                        child_session_id,
+                        Some(sequence),
+                    );
+                    state.record_frame(
+                        frame_id.to_string(),
+                        parent_frame_id,
+                        target_info
+                            .get("name")
+                            .or_else(|| target_info.get("title"))
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        target_info
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        child_session_id.to_string(),
+                    );
+                }
+                Some("Target.detachedFromTarget") => {
+                    let Some(session_id) =
+                        event.pointer("/params/sessionId").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if !state.session_frames.contains_key(session_id) {
+                        continue;
+                    }
+                    state.detach_session_at_sequence(session_id, Some(sequence));
+                    detached_sessions.push((session_id.to_string(), Some(sequence)));
+                }
+                _ => {}
+            }
+        }
+        (detached_sessions, unreplayable_sequence)
+    }) else {
+        return true;
+    };
+    if let Some(sequence) = unreplayable_sequence {
+        reset_page_history_after_unreplayable(page, sequence);
+        return true;
+    }
+    for (session_id, cutoff) in detached_sessions {
+        page.browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .finalize_console_replay_cutoff_on_detach(&session_id, cutoff);
+        clear_console_capture_for_session(page, &session_id).await;
+    }
+    false
+}
+
+async fn register_page_owned_workers_from_event_log(page: &PageInner) -> bool {
+    let events = page
+        .browser
+        .client
+        .event_log
+        .lock()
+        .unwrap()
+        .entries_since(0);
+    let Some((detached_sessions, unreplayable_sequence)) = with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        let mut detached_sessions = Vec::new();
+        let mut unreplayable_sequence = None;
+        for (sequence, event) in events {
+            if is_unreplayable_cdp_event(&event) {
+                unreplayable_sequence = Some(sequence);
+                break;
+            }
+            match event.get("method").and_then(Value::as_str) {
+                Some("Target.attachedToTarget") => {
+                    let target_info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
+                    if target_info.get("type").and_then(Value::as_str) != Some("worker") {
+                        continue;
+                    }
+                    let Some(parent_session_id) = event.get("sessionId").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let Some(child_session_id) =
+                        event.pointer("/params/sessionId").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if state.owns_session(parent_session_id) {
+                        let accepted = if let Some(target_id) =
+                            target_info.get("targetId").and_then(Value::as_str)
+                        {
+                            state.record_worker_target_session_at_sequence(
+                                target_id,
+                                child_session_id,
+                                Some(sequence),
+                            )
+                        } else {
+                            state
+                                .record_worker_session_at_sequence(child_session_id, Some(sequence))
+                        };
+                        if accepted {
+                            state.arm_worker_resume_handoff(child_session_id, Some(sequence));
+                        }
+                    }
+                }
+                Some("Target.detachedFromTarget") => {
+                    if let Some(session_id) =
+                        event.pointer("/params/sessionId").and_then(Value::as_str)
+                    {
+                        if state.remove_worker_session_at_sequence(session_id, Some(sequence)) {
+                            detached_sessions.push((session_id.to_string(), Some(sequence)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (detached_sessions, unreplayable_sequence)
+    }) else {
+        return true;
+    };
+    if let Some(sequence) = unreplayable_sequence {
+        reset_page_history_after_unreplayable(page, sequence);
+        return true;
+    }
+    for (session_id, cutoff) in detached_sessions {
+        page.browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .finalize_console_replay_cutoff_on_detach(&session_id, cutoff);
+        clear_console_capture_for_session(page, &session_id).await;
+    }
+    false
+}
+
+async fn enable_console_capture(
+    page: &PageInner,
+    timeout: Duration,
+) -> RwResult<HashMap<String, u64>> {
+    let deadline = Instant::now() + timeout;
+    if with_live_page_retention(page, || {
+        page.console_capture.requested.store(true, Ordering::SeqCst);
+    })
+    .is_none()
+    {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    }
+    if register_page_owned_iframes_from_event_log(page).await
+        || register_page_owned_workers_from_event_log(page).await
+    {
+        return Err(RwError::Message(
+            "CDP event log contains unreplayable console history".to_string(),
+        ));
+    }
     let sessions = {
         let frame_state = page.frame_state.lock().unwrap();
-        std::iter::once(page.session_id.clone())
-            .chain(frame_state.iframe_sessions_ready.iter().cloned())
-            .collect::<HashSet<_>>()
+        let mut sessions = frame_state.all_owned_session_ids();
+        sessions.extend(frame_state.worker_sessions.iter().cloned());
+        sessions.into_iter().collect::<HashSet<_>>()
     };
+    let mut replay_until = HashMap::with_capacity(sessions.len());
     for session_id in sessions {
-        enable_console_capture_for_session(page, &session_id, timeout).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(RwError::Timeout(timeout.as_millis() as u64));
+        }
+        let cutoff = enable_console_capture_for_session(page, &session_id, remaining).await?;
+        replay_until.insert(session_id, cutoff);
     }
-    Ok(())
+    Ok(replay_until)
 }
 
 async fn enable_console_capture_for_session_if_requested(
     page: &PageInner,
     session_id: &str,
     timeout: Duration,
-) -> RwResult<()> {
+) -> RwResult<Option<u64>> {
     if !page.console_capture.requested.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok(None);
     }
-    enable_console_capture_for_session(page, session_id, timeout).await
+    enable_console_capture_for_session(page, session_id, timeout)
+        .await
+        .map(Some)
+}
+
+async fn enable_runtime_with_local_console_cutoff(
+    client: &CdpClient,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<u64> {
+    client
+        .send("Runtime.enable", json!({}), Some(session_id), timeout)
+        .await?;
+    Ok(client.event_cursor())
 }
 
 async fn enable_console_capture_for_session(
     page: &PageInner,
     session_id: &str,
     timeout: Duration,
-) -> RwResult<()> {
+) -> RwResult<u64> {
     // Hold the enabled-session set across Runtime.enable. This makes first use
     // single-flight and records the session before any later console_records()
     // call can send the detectable command a second time.
     let mut enabled_sessions = page.console_capture.enabled_sessions.lock().await;
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(retention_guard) = retention_gate.lock_for_write() else {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    }
     if enabled_sessions.contains(session_id) {
-        return Ok(());
+        return Ok(page.browser.client.event_cursor());
     }
     let started = Instant::now();
-    // CDP emits replay events before the Runtime.enable response, but the page
-    // listener may consume them after the response task wakes. Keep the event
-    // cursor window explicit so scheduler order cannot restamp replayed records.
+    // Publish the provisional cutoff in CdpEventLog before Runtime.enable. Ordered consumers
+    // all read this sequenced metadata source, so replay cannot pass during setup.
+    let cutoff_generation = page
+        .browser
+        .client
+        .event_log
+        .lock()
+        .unwrap()
+        .begin_console_replay_cutoff(session_id);
     page.console_replay_until_event_cursor
         .lock()
         .unwrap()
         .insert(session_id.to_owned(), u64::MAX);
-    let enabled = page
+    drop(retention_guard);
+    let replay_until = match page
         .browser
         .client
         .send("Runtime.enable", json!({}), Some(session_id), timeout)
-        .await;
-    let replay_until = page.browser.client.event_cursor();
-    page.console_replay_until_event_cursor
-        .lock()
-        .unwrap()
-        .insert(session_id.to_owned(), replay_until);
-    enabled?;
+        .await
+    {
+        Ok(_) => {
+            let cutoff = page.browser.client.event_cursor();
+            let Some(cutoff) = with_live_page_retention(page, || {
+                page.browser
+                    .client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .finalize_console_replay_cutoff(session_id, cutoff_generation, cutoff);
+                cutoff
+            }) else {
+                return Err(RwError::TargetClosed(TargetClosedKind::Page));
+            };
+            cutoff
+        }
+        Err(error) => {
+            let _ = with_live_page_retention(page, || {
+                page.console_replay_until_event_cursor
+                    .lock()
+                    .unwrap()
+                    .remove(session_id);
+                page.browser
+                    .client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .cancel_console_replay_cutoff(session_id, cutoff_generation);
+            });
+            return Err(error);
+        }
+    };
+    if with_live_page_retention(page, || {
+        page.console_replay_until_event_cursor
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), replay_until);
+    })
+    .is_none()
+    {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    }
     let remaining = timeout.saturating_sub(started.elapsed());
     if page.observation_event_cursor.load(Ordering::SeqCst) < replay_until {
-        tokio::time::timeout(remaining, async {
+        let waited = tokio::time::timeout(remaining, async {
             while page.observation_event_cursor.load(Ordering::SeqCst) < replay_until {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .map_err(|_| RwError::Timeout(timeout.as_millis() as u64))?;
+        .await;
+        if waited.is_err() {
+            let _ = with_live_page_retention(page, || {
+                let mut replay_windows = page.console_replay_until_event_cursor.lock().unwrap();
+                if replay_windows.get(session_id) == Some(&replay_until) {
+                    replay_windows.remove(session_id);
+                }
+            });
+            return Err(RwError::Timeout(timeout.as_millis() as u64));
+        }
     }
-    let mut replay_windows = page.console_replay_until_event_cursor.lock().unwrap();
-    if replay_windows.get(session_id) == Some(&replay_until) {
-        replay_windows.remove(session_id);
+    if with_live_page_retention(page, || {
+        enabled_sessions.insert(session_id.to_string());
+    })
+    .is_none()
+    {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
     }
-    enabled_sessions.insert(session_id.to_string());
-    Ok(())
+    Ok(replay_until)
 }
 
 const ATTACHED_IFRAME_SETUP_RETRY_LIMIT: usize = 1;
@@ -45726,6 +48932,13 @@ fn spawn_attached_iframe_session_initialization(
     session_pin: FrameSessionPin,
     timeout: Duration,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     if !iframe_session_is_live(page, &frame_id, &session_pin) {
         return;
     }
@@ -45757,6 +48970,9 @@ fn spawn_attached_iframe_session_initialization(
             );
         return;
     }
+    let auto_attach_lock = page
+        .iframe_setup_tasks
+        .auto_attach_lock_for_session(&session_pin.session_id);
     let token = page
         .iframe_setup_tasks
         .next_token
@@ -45782,34 +48998,99 @@ fn spawn_attached_iframe_session_initialization(
             }
             let client = Arc::clone(&page.browser.client);
             drop(page);
-            let mut attempt = 0;
-            loop {
-                match enable_page_iframe_auto_attach(&client, &session_pin.session_id, timeout)
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(error)
-                        if attempt < ATTACHED_IFRAME_SETUP_RETRY_LIMIT
-                            && is_transient_attached_session_setup_error(&error) =>
-                    {
-                        attempt += 1;
+            {
+                let _auto_attach_guard = auto_attach_lock.lock().await;
+                let worker_auto_attach_requested = weak_page
+                    .upgrade()
+                    .map(|page| {
+                        page.frame_state
+                            .lock()
+                            .unwrap()
+                            .worker_auto_attach_requested()
+                    })
+                    .unwrap_or(false);
+                if worker_auto_attach_requested {
+                    let mut attempt = 0;
+                    loop {
+                        match enable_worker_auto_attach(&client, &session_pin.session_id, timeout)
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(error)
+                                if attempt < ATTACHED_IFRAME_SETUP_RETRY_LIMIT
+                                    && is_transient_attached_session_setup_error(&error) =>
+                            {
+                                attempt += 1;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
-                    Err(error) => return Err(error),
+                } else {
+                    let mut attempt = 0;
+                    loop {
+                        match enable_page_iframe_auto_attach(
+                            &client,
+                            &session_pin.session_id,
+                            timeout,
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error)
+                                if attempt < ATTACHED_IFRAME_SETUP_RETRY_LIMIT
+                                    && is_transient_attached_session_setup_error(&error) =>
+                            {
+                                attempt += 1;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let worker_auto_attach_requested = weak_page
+                        .upgrade()
+                        .map(|page| {
+                            page.frame_state
+                                .lock()
+                                .unwrap()
+                                .worker_auto_attach_requested()
+                        })
+                        .unwrap_or(false);
+                    if worker_auto_attach_requested {
+                        let mut attempt = 0;
+                        loop {
+                            match enable_worker_auto_attach(
+                                &client,
+                                &session_pin.session_id,
+                                timeout,
+                            )
+                            .await
+                            {
+                                Ok(()) => break,
+                                Err(error)
+                                    if attempt < ATTACHED_IFRAME_SETUP_RETRY_LIMIT
+                                        && is_transient_attached_session_setup_error(&error) =>
+                                {
+                                    attempt += 1;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
                 }
             }
 
             let Some(page) = weak_page.upgrade() else {
                 return Ok(());
             };
-            if !iframe_session_is_live(&page, &frame_id, &session_pin) {
-                return Ok(());
-            }
-            let Some(should_start) = page
-                .frame_state
-                .lock()
-                .unwrap()
-                .claim_iframe_session_setup(&frame_id, &session_pin)
-            else {
+            let Some(should_start) = with_live_page_retention(&page, || {
+                if !iframe_session_is_live(&page, &frame_id, &session_pin) {
+                    return None;
+                }
+                page.frame_state
+                    .lock()
+                    .unwrap()
+                    .claim_iframe_session_setup(&frame_id, &session_pin)
+            })
+            .flatten() else {
                 return Ok(());
             };
             drop(page);
@@ -45821,12 +49102,14 @@ fn spawn_attached_iframe_session_initialization(
             let Some(page) = weak_page.upgrade() else {
                 return Ok(());
             };
-            if iframe_session_is_live(&page, &frame_id, &session_pin) {
-                page.frame_state
-                    .lock()
-                    .unwrap()
-                    .mark_iframe_session_ready(&frame_id, &session_pin);
-            }
+            let _ = with_live_page_retention(&page, || {
+                if iframe_session_is_live(&page, &frame_id, &session_pin) {
+                    page.frame_state
+                        .lock()
+                        .unwrap()
+                        .mark_iframe_session_ready(&frame_id, &session_pin);
+                }
+            });
             Ok(())
         }
         .await;
@@ -45841,16 +49124,18 @@ fn spawn_attached_iframe_session_initialization(
             }
             drop(handles);
             if let Err(error) = result {
-                if iframe_session_is_live(&page, &frame_id, &session_pin) {
-                    page.frame_state
-                        .lock()
-                        .unwrap()
-                        .record_frame_session_error_if_current(
-                            &frame_id,
-                            &session_pin,
-                            error.to_string(),
-                        );
-                }
+                let _ = with_live_page_retention(&page, || {
+                    if iframe_session_is_live(&page, &frame_id, &session_pin) {
+                        page.frame_state
+                            .lock()
+                            .unwrap()
+                            .record_frame_session_error_if_current(
+                                &frame_id,
+                                &session_pin,
+                                error.to_string(),
+                            );
+                    }
+                });
             }
         }
     });
@@ -45878,27 +49163,41 @@ async fn setup_attached_iframe_session(
     let child_session_id = &session_pin.session_id;
     enable_attached_session_domains(&client, child_session_id, Duration::from_secs(5)).await?;
     let active_page = ensure_live()?;
-    active_page
-        .frame_state
-        .lock()
-        .unwrap()
-        .mark_page_domain_enabled(child_session_id);
+    let Some(true) = with_live_page_retention(&active_page, || {
+        if !iframe_session_is_live(&active_page, &frame_id, &session_pin) {
+            return false;
+        }
+        active_page
+            .frame_state
+            .lock()
+            .unwrap()
+            .mark_page_domain_enabled(child_session_id);
+        true
+    }) else {
+        return Err(RwError::Message(
+            "iframe session detached during attachment".to_string(),
+        ));
+    };
     drop(active_page);
     enable_action_dispatch_binding_for_session(&client, child_session_id, Duration::from_secs(5))
         .await?;
     let active_page = ensure_live()?;
     let focus_enqueued =
         enqueue_focus_emulation(&client, child_session_id, Duration::from_secs(5))?;
-    if !active_page
-        .frame_state
-        .lock()
-        .unwrap()
-        .mark_iframe_session_routable(&frame_id, &session_pin, focus_enqueued)
-    {
+    let Some(true) = with_live_page_retention(&active_page, || {
+        if !iframe_session_is_live(&active_page, &frame_id, &session_pin) {
+            return false;
+        }
+        active_page
+            .frame_state
+            .lock()
+            .unwrap()
+            .mark_iframe_session_routable(&frame_id, &session_pin, focus_enqueued)
+    }) else {
         return Err(RwError::Message(
             "iframe session detached during attachment".to_string(),
         ));
-    }
+    };
     drop(active_page);
     enable_file_chooser_intercept_for_session(&client, child_session_id, Duration::from_secs(5))
         .await?;
@@ -46083,15 +49382,68 @@ fn spawn_page_oopif_event_listener(page: Weak<PageInner>) {
     spawn_page_sequence_gated_event_listener(page, events);
 }
 
+#[cfg(test)]
+struct PageLifecycleTestBarrier {
+    entered: watch::Sender<bool>,
+    released: Arc<tokio::sync::Notify>,
+    completed: watch::Sender<bool>,
+}
+
+#[cfg(test)]
+fn page_lifecycle_test_barriers(
+) -> &'static Mutex<HashMap<(usize, String), PageLifecycleTestBarrier>> {
+    static BARRIERS: std::sync::LazyLock<
+        Mutex<HashMap<(usize, String), PageLifecycleTestBarrier>>,
+    > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    &BARRIERS
+}
+
+#[cfg(test)]
+fn install_page_lifecycle_test_barrier(
+    page: &Arc<PageInner>,
+    child_session_id: &str,
+) -> (
+    watch::Receiver<bool>,
+    watch::Receiver<bool>,
+    Arc<tokio::sync::Notify>,
+) {
+    let (entered, entered_rx) = watch::channel(false);
+    let (completed, completed_rx) = watch::channel(false);
+    let released = Arc::new(tokio::sync::Notify::new());
+    page_lifecycle_test_barriers().lock().unwrap().insert(
+        (Arc::as_ptr(page) as usize, child_session_id.to_string()),
+        PageLifecycleTestBarrier {
+            entered,
+            released: Arc::clone(&released),
+            completed,
+        },
+    );
+    (entered_rx, completed_rx, released)
+}
+
+#[cfg(test)]
+async fn wait_for_page_lifecycle_test_barrier(page: &PageInner, event: &Value) {
+    if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
+        return;
+    }
+    let Some(child_session_id) = event.pointer("/params/sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    let barrier = page_lifecycle_test_barriers().lock().unwrap().remove(&(
+        page as *const PageInner as usize,
+        child_session_id.to_string(),
+    ));
+    let Some(barrier) = barrier else {
+        return;
+    };
+    let _ = barrier.entered.send(true);
+    barrier.released.notified().await;
+    let _ = barrier.completed.send(true);
+}
+
 fn advance_observation_event_cursor(page: &PageInner, cursor: u64) {
-    let previous = page
-        .observation_event_cursor
+    page.observation_event_cursor
         .fetch_max(cursor, Ordering::SeqCst);
-    let committed_cursor = previous.max(cursor);
-    page.console_replay_until_event_cursor
-        .lock()
-        .unwrap()
-        .retain(|_, replay_until| *replay_until == u64::MAX || committed_cursor < *replay_until);
 }
 
 fn spawn_page_sequence_gated_event_listener(
@@ -46174,10 +49526,6 @@ async fn reconcile_page_oopif_events_after_lag(
         handle_page_oopif_event(Arc::clone(page), event).await;
         page.observation_event_cursor
             .store(replay_cursor, Ordering::SeqCst);
-        page.console_replay_until_event_cursor
-            .lock()
-            .unwrap()
-            .retain(|_, replay_until| *replay_until == u64::MAX || replay_cursor < *replay_until);
     }
     if overflowed {
         reconcile_page_frame_tree_authoritatively(page).await?;
@@ -46482,6 +49830,13 @@ fn record_accepted_navigation_observation(
     observation: AcceptedNavigationObservation,
     event_sequence: Option<u64>,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     let next_index = page
         .browser
         .next_native_network_index
@@ -46513,6 +49868,13 @@ fn prune_page_navigation_epochs_to_contiguous_progress(
     page: &PageInner,
     navigation_transition: &NavigationTransitionState,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(low_water_mark) = navigation_transition.contiguous_event_watermark else {
         return;
     };
@@ -46526,7 +49888,202 @@ fn prune_page_navigation_epochs_to_contiguous_progress(
         .prune_navigation_epochs_through(low_water_mark);
 }
 
+const WORKER_RESUME_HANDOFF_WATCHDOG: Duration = Duration::from_secs(1);
+
+async fn wait_for_worker_forwarding_capture(
+    page: &PageInner,
+    session_id: &str,
+    timeout: Duration,
+) -> bool {
+    let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if page
+            .frame_state
+            .lock()
+            .unwrap()
+            .worker_capture_ready_or_unclaimed(session_id)
+        {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline - now;
+        if tokio::time::timeout(remaining, updates.changed())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+}
+async fn resume_worker_after_claim(
+    page: &PageInner,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<()> {
+    let result = page
+        .browser
+        .client
+        .send(
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+            Some(session_id),
+            timeout,
+        )
+        .await
+        .map(|_| ());
+    let Some(result) = with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        match result {
+            Ok(()) => {
+                state.complete_worker_resume_handoff(session_id);
+                Ok(())
+            }
+            Err(error) => {
+                state.mark_worker_resume_handoff_failed(session_id);
+                Err(error)
+            }
+        }
+    }) else {
+        return Err(RwError::TargetClosed(TargetClosedKind::Page));
+    };
+    result
+}
+
+fn worker_resume_page_is_live(page: &PageInner) -> bool {
+    !page.lifecycle.is_closing_or_closed()
+        && !page.target_closed.load(Ordering::SeqCst)
+        && !page.browser.lifecycle.is_closing_or_closed()
+        && page.browser.client.is_connected()
+}
+
+async fn worker_resume_watchdog_step(
+    page: &PageInner,
+    session_id: &str,
+    updates: &mut watch::Receiver<u64>,
+    watchdog: Duration,
+) -> bool {
+    if !worker_resume_page_is_live(page) {
+        return false;
+    }
+    let handoff_finished = async {
+        loop {
+            let pending = page
+                .frame_state
+                .lock()
+                .unwrap()
+                .worker_resume_handoff_pending(session_id);
+            if !pending || !worker_resume_page_is_live(page) || updates.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    if tokio::time::timeout(watchdog, handoff_finished)
+        .await
+        .is_ok()
+    {
+        return false;
+    }
+    if !worker_resume_page_is_live(page) {
+        return false;
+    }
+    let Some(should_resume) = with_live_page_retention(page, || {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .take_worker_resume_fallback(session_id)
+    }) else {
+        return false;
+    };
+    if should_resume {
+        let _ = resume_worker_after_claim(page, session_id, Duration::from_secs(1)).await;
+    }
+    true
+}
+
+fn spawn_worker_resume_watchdog(page: Arc<PageInner>, session_id: String) {
+    let weak_page = Arc::downgrade(&page);
+    let mut updates = page.frame_state.lock().unwrap().subscribe_session_updates();
+    tokio::spawn(async move {
+        loop {
+            let Some(page) = weak_page.upgrade() else {
+                return;
+            };
+            if !worker_resume_watchdog_step(
+                &page,
+                &session_id,
+                &mut updates,
+                WORKER_RESUME_HANDOFF_WATCHDOG,
+            )
+            .await
+            {
+                return;
+            }
+        }
+    });
+}
+
+fn with_live_page_retention<T>(page: &PageInner, write: impl FnOnce() -> T) -> Option<T> {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return None;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(write())
+}
+
+fn reset_page_history_after_unreplayable(page: &PageInner, sequence: u64) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
+    reset_page_history_after_unreplayable_locked(page, sequence);
+}
+
+fn reset_page_history_after_unreplayable_locked(page: &PageInner, sequence: u64) {
+    page.network_requests
+        .lock()
+        .unwrap()
+        .reset_after_overflow(sequence.saturating_add(1));
+    page.native_network_records
+        .lock()
+        .unwrap()
+        .reset_after_unreplayable();
+    page.console_records
+        .lock()
+        .unwrap()
+        .reset_after_unreplayable();
+    page.console_replay_until_event_cursor
+        .lock()
+        .unwrap()
+        .clear();
+    page.frame_state
+        .lock()
+        .unwrap()
+        .mark_all_frame_caches_dirty();
+}
 async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
+    if page.lifecycle.is_closing_or_closed()
+        || page.target_closed.load(Ordering::SeqCst)
+        || !page.browser.client.retention_enabled()
+    {
+        return;
+    }
+    if is_unreplayable_cdp_event(&event) {
+        reset_page_history_after_unreplayable(
+            &page,
+            cdp_event_sequence(&event).unwrap_or_default(),
+        );
+        return;
+    }
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
     let event_sequence = cdp_event_sequence(&event);
     let is_page_navigation = matches!(
@@ -46536,6 +50093,14 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
     if !is_page_navigation {
         record_page_observation_event(&page, &event);
     }
+    if page.lifecycle.is_closing_or_closed()
+        || page.target_closed.load(Ordering::SeqCst)
+        || !page.browser.client.retention_enabled()
+    {
+        return;
+    }
+    #[cfg(test)]
+    wait_for_page_lifecycle_test_barrier(&page, &event).await;
     if method == "Target.targetCrashed"
         && event.pointer("/params/targetId").and_then(Value::as_str)
             == Some(page.target_id.as_str())
@@ -46554,6 +50119,7 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             == Some(page.target_id.as_str())
     {
         page.target_closed.store(true, Ordering::SeqCst);
+        page.clear_worker_resume_handoffs();
         page.abort_iframe_setup_tasks();
         return;
     }
@@ -46564,6 +50130,7 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
                 == Some(page.session_id.as_str()))
     {
         page.target_closed.store(true, Ordering::SeqCst);
+        page.clear_worker_resume_handoffs();
         page.abort_iframe_setup_tasks();
         return;
     }
@@ -46588,6 +50155,54 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if target_type == "worker" {
+            let Some(accepted) = with_live_page_retention(&page, || {
+                let mut state = page.frame_state.lock().unwrap();
+                if let Some(target_id) = target_info.get("targetId").and_then(Value::as_str) {
+                    state.record_worker_target_session_at_sequence(
+                        target_id,
+                        child_session_id,
+                        event_sequence,
+                    )
+                } else {
+                    state.worker_session_attachment_is_current(child_session_id, event_sequence)
+                        && (state
+                            .worker_session_recorded_at_sequence(child_session_id, event_sequence)
+                            || state.record_worker_session_at_sequence(
+                                child_session_id,
+                                event_sequence,
+                            ))
+                }
+            }) else {
+                return;
+            };
+            if !accepted {
+                return;
+            }
+            let child_session_id = child_session_id.to_string();
+            let Some(resume_without_consumer) = with_live_page_retention(&page, || {
+                let mut state = page.frame_state.lock().unwrap();
+                state.arm_worker_resume_handoff(&child_session_id, event_sequence);
+                !state.worker_event_interest()
+                    && state.take_worker_resume_fallback(&child_session_id)
+            }) else {
+                return;
+            };
+            if resume_without_consumer {
+                let page_for_resume = Arc::clone(&page);
+                let session_for_resume = child_session_id.clone();
+                tokio::spawn(async move {
+                    let _ = resume_worker_after_claim(
+                        &page_for_resume,
+                        &session_for_resume,
+                        Duration::from_secs(1),
+                    )
+                    .await;
+                });
+            }
+            spawn_worker_resume_watchdog(Arc::clone(&page), child_session_id);
+            return;
+        }
         if target_type != "iframe" {
             let client = Arc::clone(&page.browser.client);
             let child_session_id = child_session_id.to_string();
@@ -46628,12 +50243,33 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
             event_sequence,
             Duration::from_secs(5),
         ) {
-            let mut state = page.frame_state.lock().unwrap();
-            if pin.session_id == child_session_id
-                && state.session_pin_still_owns_frame(frame_id, &pin)
-            {
-                state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
-            }
+            let _ = with_live_page_retention(&page, || {
+                let mut state = page.frame_state.lock().unwrap();
+                if pin.session_id == child_session_id
+                    && state.session_pin_still_owns_frame(frame_id, &pin)
+                {
+                    state.seed_attached_frame_metadata(frame_id, &pin, target_name, target_url);
+                }
+            });
+        }
+        if page
+            .frame_state
+            .lock()
+            .unwrap()
+            .worker_auto_attach_requested()
+        {
+            let client = Arc::clone(&page.browser.client);
+            let child_session_id = child_session_id.to_string();
+            tokio::spawn(async move {
+                let _ = client
+                    .send(
+                        "Runtime.runIfWaitingForDebugger",
+                        json!({}),
+                        Some(&child_session_id),
+                        Duration::from_secs(1),
+                    )
+                    .await;
+            });
         }
         return;
     }
@@ -46643,12 +50279,25 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
         else {
             return;
         };
-        let generations = {
+        let Some((worker_detached, generations)) = with_live_page_retention(&page, || {
             let mut state = page.frame_state.lock().unwrap();
+            let worker_detached =
+                state.remove_worker_session_at_sequence(detached_session_id, event_sequence);
             let generations = state.setup_generations_for_session(detached_session_id);
             state.detach_session_at_sequence(detached_session_id, event_sequence);
-            generations
+            (worker_detached, generations)
+        }) else {
+            return;
         };
+        page.browser
+            .client
+            .event_log
+            .lock()
+            .unwrap()
+            .finalize_console_replay_cutoff_on_detach(detached_session_id, event_sequence);
+        if worker_detached {
+            clear_console_capture_for_session(&page, detached_session_id).await;
+        }
         page.iframe_setup_tasks.abort_generations(generations);
         return;
     }
@@ -46666,10 +50315,10 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
         return;
     }
     let params = event.get("params").unwrap_or(&Value::Null);
-    match method {
+    let Some(observation) = with_live_page_retention(&page, || match method {
         "Page.frameAttached" => {
             let Some(frame_id) = params.get("frameId").and_then(Value::as_str) else {
-                return;
+                return None;
             };
             let parent_id = params
                 .get("parentFrameId")
@@ -46685,64 +50334,54 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
                     event_session_id.to_string(),
                 );
             }
+            None
         }
         "Page.frameNavigated" => {
             let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
-            let observation = {
-                let mut main_frame_id = page.main_frame_id.lock().unwrap();
-                let mut state = page.frame_state.lock().unwrap();
-                apply_accepted_frame_navigation_transition(
-                    &mut state,
-                    &mut main_frame_id,
-                    &page.crashed,
-                    page.session_id.as_str(),
-                    event_session_id,
-                    event_sequence,
-                    params.get("frame").unwrap_or(&Value::Null),
-                )
-            };
-            if let Some(observation) = observation {
-                record_accepted_navigation_observation(&page, observation, event_sequence);
-            }
+            let mut main_frame_id = page.main_frame_id.lock().unwrap();
+            let mut state = page.frame_state.lock().unwrap();
+            apply_accepted_frame_navigation_transition(
+                &mut state,
+                &mut main_frame_id,
+                &page.crashed,
+                page.session_id.as_str(),
+                event_session_id,
+                event_sequence,
+                params.get("frame").unwrap_or(&Value::Null),
+            )
         }
         "Page.navigatedWithinDocument" => {
             let _navigation_transition = page.navigation_transition_lock.lock().unwrap();
-            let observation = {
-                let main_frame_id = page.main_frame_id.lock().unwrap();
-                let mut state = page.frame_state.lock().unwrap();
-                apply_accepted_same_document_navigation_transition(
-                    &mut state,
-                    &main_frame_id,
-                    page.session_id.as_str(),
-                    event_session_id,
-                    event_sequence,
-                    params,
-                )
-            };
-            if let Some(observation) = observation {
-                record_accepted_navigation_observation(&page, observation, event_sequence);
-            }
+            let main_frame_id = page.main_frame_id.lock().unwrap();
+            let mut state = page.frame_state.lock().unwrap();
+            apply_accepted_same_document_navigation_transition(
+                &mut state,
+                &main_frame_id,
+                page.session_id.as_str(),
+                event_session_id,
+                event_sequence,
+                params,
+            )
         }
         "Page.frameDetached" => {
             let reason = params.get("reason").and_then(Value::as_str).unwrap_or("");
             let mut state = page.frame_state.lock().unwrap();
             if state.mark_frame_cache_dirty_at_sequence(event_session_id, event_sequence) {
                 if let Some(frame_id) = params.get("frameId").and_then(Value::as_str) {
-                    if reason == "swap" {
+                    let removed_generations = if reason == "swap" {
                         let removed_generation =
                             state.mark_frame_swap_pending(frame_id, event_session_id);
                         state.record_frame_swap(frame_id);
-                        drop(state);
-                        page.iframe_setup_tasks
-                            .abort_generations(removed_generation);
+                        removed_generation.into_iter().collect()
                     } else {
-                        let removed_generations = state.remove_frame(frame_id);
-                        drop(state);
-                        page.iframe_setup_tasks
-                            .abort_generations(removed_generations);
-                    }
+                        state.remove_frame(frame_id)
+                    };
+                    drop(state);
+                    page.iframe_setup_tasks
+                        .abort_generations(removed_generations);
                 }
             }
+            None
         }
         "Runtime.executionContextDestroyed" => {
             if let Some(context_id) = params.get("executionContextId") {
@@ -46751,14 +50390,21 @@ async fn handle_page_oopif_event(page: Arc<PageInner>, event: Value) {
                     .unwrap()
                     .invalidate_execution_context(event_session_id, context_id);
             }
+            None
         }
         "Runtime.executionContextsCleared" => {
             page.frame_state
                 .lock()
                 .unwrap()
                 .invalidate_execution_contexts_for_session(event_session_id);
+            None
         }
-        _ => {}
+        _ => None,
+    }) else {
+        return;
+    };
+    if let Some(observation) = observation {
+        record_accepted_navigation_observation(&page, observation, event_sequence);
     }
 }
 
@@ -46771,6 +50417,20 @@ fn record_page_observation_event_with_ownership(
     event: &Value,
     replay_owned_session: Option<bool>,
 ) {
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
+    if is_unreplayable_cdp_event(event) {
+        reset_page_history_after_unreplayable_locked(
+            page,
+            cdp_event_sequence(event).unwrap_or_default(),
+        );
+        return;
+    }
     let event_sequence = cdp_event_sequence(event);
     let event_cursor = event_sequence.map(|sequence| sequence.saturating_add(1));
     let event_session_id = event.get("sessionId").and_then(Value::as_str);
@@ -47589,6 +51249,7 @@ struct ReconciledFrameCacheInvalidations {
     navigation_observations: Vec<AcceptedNavigationObservationAtSequence>,
     replayed_page_observations: Vec<ReplayedPageObservation>,
     removed_setup_generations: Vec<u64>,
+    unreplayable_sequences: Vec<u64>,
 }
 
 fn reconcile_frame_cache_invalidations_locked(
@@ -47613,6 +51274,11 @@ fn reconcile_frame_cache_invalidations_locked(
         .unwrap_or(frame_replay_cursor);
     for (sequence, event) in log.entries_since(replay_start) {
         let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+        if is_unreplayable_cdp_event(&event) {
+            reconciliation.unreplayable_sequences.push(sequence);
+            state.mark_all_frame_caches_dirty();
+            continue;
+        }
         if observation_replay_cursor.is_some_and(|cursor| sequence >= cursor)
             && !matches!(
                 method,
@@ -47873,6 +51539,13 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
     // Serializing gate commit through post-lock observation prevents a newer
     // live navigation from overtaking a replayed observation. The same guard
     // owns the one contiguous progress watermark.
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return;
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return;
+    }
     let mut navigation_transition = page.navigation_transition_lock.lock().unwrap();
     // Global page cache lock order: event_log -> main_frame_id -> frame_state.
     let (reconciliation, unknown_gap_boundary) = {
@@ -47881,9 +51554,9 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
         let mut main_frame_id = page.main_frame_id.lock().unwrap();
         let mut state = page.frame_state.lock().unwrap();
         let oldest_sequence = log.oldest_seq();
-        let unknown_gap_boundary = navigation_transition
+        let mut unknown_gap_boundary = navigation_transition
             .has_unreplayable_gap(oldest_sequence)
-            .then(|| oldest_sequence - 1);
+            .then(|| oldest_sequence.saturating_sub(1));
         if listener_gap {
             state.mark_all_frame_caches_dirty();
         }
@@ -47896,8 +51569,19 @@ fn reconcile_frame_cache_invalidations_impl_with_hook(
             None,
             listener_gap.then(|| page.observation_event_cursor.load(Ordering::SeqCst)),
         );
+        if let Some(sequence) = reconciliation.unreplayable_sequences.iter().copied().min() {
+            let marker_boundary = sequence.saturating_sub(1);
+            unknown_gap_boundary = Some(
+                unknown_gap_boundary
+                    .map_or(marker_boundary, |current| current.min(marker_boundary)),
+            );
+        }
         (reconciliation, unknown_gap_boundary)
     };
+    drop(_retention_guard);
+    for sequence in reconciliation.unreplayable_sequences.iter().copied() {
+        reset_page_history_after_unreplayable(page, sequence);
+    }
     if let Some(sequence) = unknown_gap_boundary {
         // The bounded log can no longer replay every uncovered listener event.
         // Place the conservative boundary immediately before the oldest
@@ -48065,6 +51749,13 @@ async fn refresh_frame_tree_session_locked(
     // Commit lock order is event_log -> main_frame_id -> frame_state. Holding
     // event_log prevents a transport event from being inserted between the
     // cursor barrier and the generation/registration recheck.
+    let retention_gate = page.browser.client.retention_gate();
+    let Some(_retention_guard) = retention_gate.lock_for_write() else {
+        return Ok(());
+    };
+    if page.lifecycle.is_closing_or_closed() || page.target_closed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let root_frame_id = tree.root_frame_id.clone();
     let navigation_transition = page.navigation_transition_lock.lock().unwrap();
     let (reconciliation, authoritative_effects) = {
@@ -48100,6 +51791,7 @@ async fn refresh_frame_tree_session_locked(
         };
         (reconciliation, authoritative_effects)
     };
+    drop(_retention_guard);
     record_reconciled_navigation_observations(page, reconciliation.navigation_observations);
     drop(navigation_transition);
     page.iframe_setup_tasks.abort_generations(
@@ -49169,6 +52861,110 @@ fn launch_chromium_process(
     }
 }
 
+const CHROMIUM_FEATURE_SWITCHES: [&str; 3] = [
+    "--disable-features",
+    "--enable-features",
+    "--disable-blink-features",
+];
+
+fn chromium_feature_switch_index(arg: &str) -> Option<usize> {
+    CHROMIUM_FEATURE_SWITCHES.iter().position(|name| {
+        arg.strip_prefix(name)
+            .is_some_and(|value| value.starts_with('='))
+    })
+}
+
+fn append_chromium_feature_values(
+    values: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    arg: &str,
+    name: &str,
+) {
+    let Some(feature_list) = arg
+        .strip_prefix(name)
+        .and_then(|value| value.strip_prefix('='))
+    else {
+        return;
+    };
+    for feature in feature_list.split(',') {
+        let feature = feature.trim();
+        if !feature.is_empty() && seen.insert(feature.to_string()) {
+            values.push(feature.to_string());
+        }
+    }
+}
+
+fn chromium_effective_launch_arg_parts(options: &LaunchOptions) -> (Vec<String>, Vec<String>) {
+    if options.ignore_all_default_args {
+        return (Vec::new(), options.args.clone());
+    }
+
+    let default_args = chromium_default_launch_args(options);
+    let mut effective_defaults = Vec::with_capacity(default_args.len());
+    let mut effective_user_args = Vec::with_capacity(options.args.len());
+    let mut feature_positions = [None; CHROMIUM_FEATURE_SWITCHES.len()];
+    let mut feature_values: Vec<Vec<String>> = (0..CHROMIUM_FEATURE_SWITCHES.len())
+        .map(|_| Vec::new())
+        .collect();
+    let mut feature_seen: Vec<HashSet<String>> = (0..CHROMIUM_FEATURE_SWITCHES.len())
+        .map(|_| HashSet::new())
+        .collect();
+
+    for arg in default_args {
+        if launch_default_arg_ignored(&arg, &options.ignore_default_args) {
+            continue;
+        }
+        if let Some(index) = chromium_feature_switch_index(&arg) {
+            if feature_positions[index].is_none() {
+                feature_positions[index] = Some(effective_defaults.len());
+                effective_defaults.push(String::new());
+            }
+            append_chromium_feature_values(
+                &mut feature_values[index],
+                &mut feature_seen[index],
+                &arg,
+                CHROMIUM_FEATURE_SWITCHES[index],
+            );
+        } else {
+            effective_defaults.push(arg);
+        }
+    }
+
+    for arg in &options.args {
+        if let Some(index) = chromium_feature_switch_index(arg) {
+            if feature_positions[index].is_some() {
+                append_chromium_feature_values(
+                    &mut feature_values[index],
+                    &mut feature_seen[index],
+                    arg,
+                    CHROMIUM_FEATURE_SWITCHES[index],
+                );
+                continue;
+            }
+        }
+        effective_user_args.push(arg.clone());
+    }
+
+    for (index, position) in feature_positions.into_iter().enumerate() {
+        if let Some(position) = position {
+            effective_defaults[position] = format!(
+                "{}={}",
+                CHROMIUM_FEATURE_SWITCHES[index],
+                feature_values[index].join(",")
+            );
+        }
+    }
+    (effective_defaults, effective_user_args)
+}
+
+#[cfg(test)]
+fn chromium_effective_launch_args(options: &LaunchOptions) -> Vec<String> {
+    let (mut effective_defaults, effective_user_args) =
+        chromium_effective_launch_arg_parts(options);
+    effective_defaults.extend(effective_user_args);
+    effective_defaults
+}
+
 fn chromium_default_launch_args(options: &LaunchOptions) -> Vec<String> {
     let mut default_args = vec![
         "--no-first-run".to_string(),
@@ -49182,6 +52978,23 @@ fn chromium_default_launch_args(options: &LaunchOptions) -> Vec<String> {
         "--disable-renderer-backgrounding".to_string(),
         "--disable-popup-blocking".to_string(),
         "--disable-prompt-on-repost".to_string(),
+        "--disable-back-forward-cache".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-component-update".to_string(),
+        "--disable-field-trial-config".to_string(),
+        "--metrics-recording-only".to_string(),
+        "--no-service-autorun".to_string(),
+        "--disable-sync".to_string(),
+        "--disable-default-apps".to_string(),
+        "--disable-hang-monitor".to_string(),
+        "--disable-ipc-flooding-protection".to_string(),
+        "--disable-breakpad".to_string(),
+        "--disable-client-side-phishing-detection".to_string(),
+        "--disable-component-extensions-with-background-pages".to_string(),
+        "--allow-pre-commit-input".to_string(),
+        "--force-color-profile=srgb".to_string(),
+        "--disable-search-engine-choice-screen".to_string(),
+        "--disable-features=DialMediaRouteProvider,GlobalMediaControls,MediaRouter,OptimizationHints,Translate,HttpsUpgrades,PaintHolding,ThirdPartyStoragePartitioning,DestroyProfileOnBrowserClose,AvoidUnnecessaryBeforeUnloadCheckSync,LensOverlay".to_string(),
         "--enable-features=CDPScreenshotNewSurface".to_string(),
         "--mute-audio".to_string(),
     ];
@@ -49246,13 +53059,10 @@ fn launch_chromium_attempt(
         }
     }
 
-    let default_args = chromium_default_launch_args(options);
-    if !options.ignore_all_default_args {
-        for arg in default_args {
-            if !launch_default_arg_ignored(&arg, &options.ignore_default_args) {
-                command.arg(arg);
-            }
-        }
+    let (effective_default_args, effective_user_args) =
+        chromium_effective_launch_arg_parts(options);
+    for arg in effective_default_args {
+        command.arg(arg);
     }
     for (key, value) in &options.env {
         command.env(key, value);
@@ -49263,7 +53073,7 @@ fn launch_chromium_attempt(
             command.arg(format!("--proxy-bypass-list={bypass}"));
         }
     }
-    for arg in &options.args {
+    for arg in effective_user_args {
         command.arg(arg);
     }
     if single_process_fallback && !has_chromium_arg(&options.args, "--single-process") {
@@ -50166,6 +53976,14 @@ fn process_network_observation_event(
     state: &mut NetworkObservationState,
 ) -> Result<Option<(u64, &'static str, Value)>, u64> {
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    if is_unreplayable_cdp_event(event) {
+        requests
+            .lock()
+            .unwrap()
+            .reset_after_overflow(seq.saturating_add(1));
+        *state = NetworkObservationState::new();
+        return Err(1);
+    }
     let request_payload = {
         let mut requests = requests.lock().unwrap();
         if seq > requests.next_applied_seq {
@@ -50190,6 +54008,11 @@ fn process_network_observation_event(
                     let dropped = missed_seq.saturating_sub(expected_seq).max(1);
                     requests.reset_after_overflow(seq.saturating_add(1));
                     return Err(dropped);
+                }
+                if is_unreplayable_cdp_event(&missed_event) {
+                    requests.reset_after_overflow(seq.saturating_add(1));
+                    *state = NetworkObservationState::new();
+                    return Err(1);
                 }
                 apply_network_request_mutation(
                     missed_seq,
@@ -50330,6 +54153,7 @@ fn page_event_envelope(seq: u64, kind: &str, payload: Value) -> Value {
     })
 }
 
+#[cfg(test)]
 fn process_page_observation_event(
     seq: u64,
     event: &Value,
@@ -50338,6 +54162,54 @@ fn process_page_observation_event(
     requests: &Arc<Mutex<NetworkRequestStore>>,
     state: &mut PageEventStreamState,
 ) {
+    process_page_observation_event_with_page(
+        seq, event, event_log, session_id, requests, state, None,
+    );
+}
+
+fn process_page_observation_event_with_page(
+    seq: u64,
+    event: &Value,
+    event_log: &Arc<Mutex<CdpEventLog>>,
+    session_id: &str,
+    requests: &Arc<Mutex<NetworkRequestStore>>,
+    state: &mut PageEventStreamState,
+    page: Option<&PageInner>,
+) {
+    if page.is_some_and(|page| {
+        page.lifecycle.is_closing_or_closed()
+            || page.target_closed.load(Ordering::SeqCst)
+            || !page.browser.client.retention_enabled()
+    }) {
+        return;
+    }
+    if is_unreplayable_cdp_event(event) {
+        if let Some(page) = page {
+            reset_page_history_after_unreplayable_locked(page, seq);
+            *state = PageEventStreamState::for_page(page);
+        } else {
+            requests
+                .lock()
+                .unwrap()
+                .reset_after_overflow(seq.saturating_add(1));
+            state.reset_after_overflow();
+        }
+        state.ready.insert(
+            seq,
+            page_event_envelope(
+                seq,
+                "_overflow",
+                json!({
+                    "dropped": 1,
+                    "reason": "unreplayable_event",
+                }),
+            ),
+        );
+        return;
+    }
+    state.ensure_main_session(session_id);
+    state.sync_replay_cutoffs_for_event(event, event_log);
+    state.apply_target_transition(event, session_id);
     let method = event.get("method").and_then(Value::as_str).unwrap_or("");
     let matched = match process_network_observation_event(
         seq,
@@ -50350,7 +54222,7 @@ fn process_page_observation_event(
     ) {
         Ok(matched) => matched,
         Err(dropped) => {
-            *state = PageEventStreamState::new();
+            state.reset_after_overflow();
             state.ready.insert(
                 seq,
                 page_event_envelope(seq, "_overflow", json!({ "dropped": dropped })),
@@ -50367,8 +54239,20 @@ fn process_page_observation_event(
         return;
     }
 
-    let matches_session = event.get("sessionId").and_then(Value::as_str) == Some(session_id);
-    if !matches_session {
+    let Some(event_session_id) = event.get("sessionId").and_then(Value::as_str) else {
+        return;
+    };
+    if !state.owns_session(event_session_id) {
+        return;
+    }
+    if matches!(
+        method,
+        "Runtime.consoleAPICalled" | "Runtime.exceptionThrown"
+    ) && state
+        .replay_until
+        .get(event_session_id)
+        .is_some_and(|cutoff| *cutoff == u64::MAX || seq < *cutoff)
+    {
         return;
     }
     let matched = match method {
@@ -50439,6 +54323,8 @@ fn append_ready_page_events(
     }
 }
 
+const PAGE_EVENT_LOG_SCAN_CHUNK: usize = 256;
+
 async fn wait_for_page_event_batch(
     events: &mut broadcast::Receiver<Value>,
     event_log: Arc<Mutex<CdpEventLog>>,
@@ -50446,6 +54332,7 @@ async fn wait_for_page_event_batch(
     session_id: &str,
     requests: Arc<Mutex<NetworkRequestStore>>,
     state: &mut PageEventStreamState,
+    page: &PageInner,
     mut close_rx: watch::Receiver<bool>,
     mut alive_rx: watch::Receiver<bool>,
     timeout: Duration,
@@ -50454,6 +54341,13 @@ async fn wait_for_page_event_batch(
     let deadline = tokio::time::Instant::now() + timeout;
     let mut batch = Vec::with_capacity(max_events);
     loop {
+        if page.lifecycle.is_closing_or_closed()
+            || page.target_closed.load(Ordering::SeqCst)
+            || !page.browser.client.retention_enabled()
+        {
+            batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+            return (batch, true);
+        }
         if *close_rx.borrow() {
             batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
             return (batch, true);
@@ -50468,15 +54362,27 @@ async fn wait_for_page_event_batch(
             return (batch, false);
         }
 
+        let raw_limit = (max_events - batch.len())
+            .min(PAGE_EVENT_LOG_SCAN_CHUNK)
+            .max(1);
         let (oldest_seq, entries) = {
             let log = event_log.lock().unwrap();
-            (log.oldest_seq(), log.entries_since(*cursor))
+            (
+                log.oldest_seq(),
+                log.entries_since_limited(*cursor, raw_limit),
+            )
         };
+        let scanned_full_chunk = entries.len() >= raw_limit;
         if *cursor < oldest_seq {
             let dropped = oldest_seq - *cursor;
-            *cursor = oldest_seq;
-            *state = PageEventStreamState::new();
-            requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            let Some(()) = with_live_page_retention(page, || {
+                *cursor = oldest_seq;
+                *state = PageEventStreamState::for_page(page);
+                requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            }) else {
+                batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                return (batch, true);
+            };
             batch.push(page_event_envelope(
                 *cursor,
                 "_overflow",
@@ -50491,7 +54397,20 @@ async fn wait_for_page_event_batch(
                 continue;
             }
             *cursor = seq.saturating_add(1);
-            process_page_observation_event(seq, &event, &event_log, session_id, &requests, state);
+            let retention_gate = page.browser.client.retention_gate();
+            let Some(_retention_guard) = retention_gate.lock_for_write() else {
+                batch.push(page_event_envelope(*cursor, "_closed", Value::Null));
+                return (batch, true);
+            };
+            process_page_observation_event_with_page(
+                seq,
+                &event,
+                &event_log,
+                session_id,
+                &requests,
+                state,
+                Some(page),
+            );
             expire_page_responses(state);
             append_ready_page_events(&mut batch, state, max_events);
             if batch.len() >= max_events {
@@ -50500,6 +54419,9 @@ async fn wait_for_page_event_batch(
         }
         if !batch.is_empty() {
             return (batch, false);
+        }
+        if scanned_full_chunk {
+            continue;
         }
 
         let now = tokio::time::Instant::now();
@@ -50552,6 +54474,7 @@ async fn wait_for_network_event(
     session_id: &str,
     kind: &str,
     requests: Arc<Mutex<NetworkRequestStore>>,
+    page: Arc<PageInner>,
     timeout: Duration,
 ) -> (RwResult<String>, u64) {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -50559,6 +54482,12 @@ async fn wait_for_network_event(
     let mut state = NetworkObservationState::new();
     let mut ready_responses = BTreeMap::<u64, String>::new();
     loop {
+        if page.lifecycle.is_closing_or_closed()
+            || page.target_closed.load(Ordering::SeqCst)
+            || !page.browser.client.retention_enabled()
+        {
+            return (Err(RwError::TargetClosed(TargetClosedKind::Page)), cursor);
+        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return (Err(RwError::Timeout(timeout.as_millis() as u64)), cursor);
@@ -50585,7 +54514,13 @@ async fn wait_for_network_event(
         };
         if cursor < oldest_seq {
             let dropped = oldest_seq - cursor;
-            requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            if with_live_page_retention(&page, || {
+                requests.lock().unwrap().reset_after_overflow(oldest_seq);
+            })
+            .is_none()
+            {
+                return (Err(RwError::TargetClosed(TargetClosedKind::Page)), cursor);
+            }
             return (
                 Err(RwError::Message(format!(
                     "CDP event log overflow: dropped {dropped} event(s)"
@@ -50595,9 +54530,14 @@ async fn wait_for_network_event(
         }
         for (seq, event) in entries {
             cursor = seq.saturating_add(1);
-            let matched = match process_network_wait_event(
-                seq, &event, &event_log, session_id, kind, &requests, &mut state,
-            ) {
+            let Some(processed) = with_live_page_retention(&page, || {
+                process_network_wait_event(
+                    seq, &event, &event_log, session_id, kind, &requests, &mut state,
+                )
+            }) else {
+                return (Err(RwError::TargetClosed(TargetClosedKind::Page)), cursor);
+            };
+            let matched = match processed {
                 Ok(matched) => matched,
                 Err(dropped) => {
                     return (
@@ -50693,6 +54633,44 @@ async fn wait_for_route_event(
     }
 }
 
+async fn wait_for_dialog_event(
+    events: &mut broadcast::Receiver<Value>,
+    session_id: &str,
+    timeout: Duration,
+) -> RwResult<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(RwError::Timeout(timeout.as_millis() as u64));
+        }
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(event)) => {
+                let matches_session = event
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(|value| value == session_id)
+                    .unwrap_or(false);
+                if !matches_session {
+                    continue;
+                }
+                if event.get("method").and_then(Value::as_str)
+                    != Some("Page.javascriptDialogOpening")
+                {
+                    continue;
+                }
+                if let Some(dialog) = dialog_from_event(&event) {
+                    return Ok(dialog.to_string());
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
+            Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
+        }
+    }
+}
+
 async fn wait_for_auth_event(
     events: &mut broadcast::Receiver<Value>,
     session_id: &str,
@@ -50746,76 +54724,452 @@ async fn wait_for_auth_event(
     }
 }
 
-async fn wait_for_dialog_event(
-    events: &mut broadcast::Receiver<Value>,
-    session_id: &str,
-    timeout: Duration,
-) -> RwResult<String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return Err(RwError::Timeout(timeout.as_millis() as u64));
-        }
-        let remaining = deadline - now;
-        match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Ok(event)) => {
-                let matches_session = event
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(|value| value == session_id)
-                    .unwrap_or(false);
-                if !matches_session {
-                    continue;
-                }
-                if event.get("method").and_then(Value::as_str)
-                    != Some("Page.javascriptDialogOpening")
-                {
-                    continue;
-                }
-                if let Some(dialog) = dialog_from_event(&event) {
-                    return Ok(dialog.to_string());
-                }
-            }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
-            Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
-        }
+fn json_value_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
     }
 }
 
+fn page_error_event_text(event: &Value) -> (String, String) {
+    let params = event.get("params").unwrap_or(&Value::Null);
+    let details = params
+        .get("exceptionDetails")
+        .filter(|value| value.is_object())
+        .unwrap_or(params);
+    let exception = details
+        .get("exception")
+        .filter(|value| value.is_object())
+        .unwrap_or(&Value::Null);
+    let description = ["description", "value"]
+        .iter()
+        .find_map(|key| {
+            exception
+                .get(*key)
+                .filter(|value| json_value_is_truthy(value))
+        })
+        .or_else(|| {
+            details
+                .get("text")
+                .filter(|value| json_value_is_truthy(value))
+        })
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_else(|| "Page error".to_string());
+    let mut text = description.lines().next().unwrap_or("").to_string();
+    if let Some((prefix, rest)) = text.split_once(':') {
+        if prefix.ends_with("Error")
+            || matches!(
+                prefix,
+                "Error" | "TypeError" | "ReferenceError" | "SyntaxError" | "RangeError"
+            )
+        {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                text = trimmed.to_string();
+            }
+        }
+    }
+    if text.is_empty() {
+        text = "Page error".to_string();
+    }
+    let event_type = exception
+        .get("className")
+        .and_then(Value::as_str)
+        .unwrap_or("Error")
+        .to_string();
+    (text, event_type)
+}
+
+fn console_event_matches(
+    event: &Value,
+    event_type: Option<&str>,
+    text: Option<&str>,
+    exact_text: bool,
+) -> bool {
+    let params = event.get("params").unwrap_or(&Value::Null);
+    if let Some(expected_type) = event_type {
+        if params.get("type").and_then(Value::as_str) != Some(expected_type) {
+            return false;
+        }
+    }
+    let Some(expected_text) = text else {
+        return true;
+    };
+    let Some(payload) = console_from_event(event) else {
+        return false;
+    };
+    let actual_text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+    if exact_text {
+        actual_text == expected_text
+    } else {
+        actual_text.contains(expected_text)
+    }
+}
+
+fn page_error_event_matches(
+    event: &Value,
+    event_type: Option<&str>,
+    text: Option<&str>,
+    exact_text: bool,
+) -> bool {
+    let (actual_text, actual_type) = page_error_event_text(event);
+    if event_type.is_some_and(|expected_type| expected_type != actual_type) {
+        return false;
+    }
+    text.map(|expected_text| {
+        if exact_text {
+            actual_text == expected_text
+        } else {
+            actual_text.contains(expected_text)
+        }
+    })
+    .unwrap_or(true)
+}
+
+fn console_wait_owner_error(page: &PageInner) -> Option<RwError> {
+    if page.crashed.load(Ordering::SeqCst) {
+        return Some(RwError::PageCrashed);
+    }
+    if page.lifecycle.is_closing_or_closed()
+        || page.target_closed.load(Ordering::SeqCst)
+        || !page.browser.client.is_connected()
+    {
+        return Some(RwError::TargetClosed(TargetClosedKind::Page));
+    }
+    None
+}
+
+fn page_worker_session_from_attachment(page: &PageInner, event: &Value) -> Option<String> {
+    if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
+        return None;
+    }
+    let event_sequence = cdp_event_sequence(event);
+    let parent_session_id = event.get("sessionId").and_then(Value::as_str)?;
+    let target_info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
+    if target_info.get("type").and_then(Value::as_str) != Some("worker") {
+        return None;
+    }
+    let child_session_id = event.pointer("/params/sessionId").and_then(Value::as_str)?;
+    with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        if !state.owns_session(parent_session_id) {
+            return None;
+        }
+        let accepted = if let Some(target_id) = target_info.get("targetId").and_then(Value::as_str)
+        {
+            state.record_worker_target_session_at_sequence(
+                target_id,
+                child_session_id,
+                event_sequence,
+            )
+        } else {
+            state.worker_session_attachment_is_current(child_session_id, event_sequence)
+                && (state.worker_session_recorded_at_sequence(child_session_id, event_sequence)
+                    || state.record_worker_session_at_sequence(child_session_id, event_sequence))
+        };
+        if !accepted {
+            return None;
+        }
+        state.arm_worker_resume_handoff(child_session_id, event_sequence);
+        state
+            .claim_worker_resume_handoff(child_session_id)
+            .then(|| child_session_id.to_string())
+    })
+    .flatten()
+}
+
+fn remove_page_worker_session_from_detachment(page: &PageInner, event: &Value) -> Option<String> {
+    if event.get("method").and_then(Value::as_str) != Some("Target.detachedFromTarget") {
+        return None;
+    }
+    let session_id = event.pointer("/params/sessionId").and_then(Value::as_str)?;
+    let accepted = with_live_page_retention(page, || {
+        page.frame_state
+            .lock()
+            .unwrap()
+            .remove_worker_session_at_sequence(session_id, cdp_event_sequence(event))
+    })?;
+    accepted.then(|| session_id.to_string())
+}
+
+async fn process_console_wait_event(
+    event: Value,
+    event_cursor: &mut u64,
+    replay_start_cursor: u64,
+    event_log: &Arc<Mutex<CdpEventLog>>,
+    session_id: &str,
+    replay_until: &HashMap<String, u64>,
+    event_kind: &str,
+    page: Option<Arc<PageInner>>,
+    mut page_state: Option<&mut PageEventStreamState>,
+    event_type: Option<&str>,
+    text: Option<&str>,
+    exact_text: bool,
+) -> RwResult<Option<String>> {
+    if is_unreplayable_cdp_event(&event) {
+        let sequence = cdp_event_sequence(&event).unwrap_or_default();
+        if let Some(page) = page.as_deref() {
+            reset_page_history_after_unreplayable(page, sequence);
+        }
+        if let Some(state) = page_state.as_mut() {
+            state.reset_after_overflow();
+        }
+        return Err(RwError::Message(format!(
+            "CDP event log contains unreplayable event at sequence {sequence}"
+        )));
+    }
+    let event_sequence = cdp_event_sequence(&event);
+    let event_session_id = event.get("sessionId").and_then(Value::as_str);
+    let method = event.get("method").and_then(Value::as_str);
+    if event_sequence.is_some_and(|sequence| sequence < *event_cursor) {
+        return Ok(None);
+    }
+    if let Some(sequence) = event_sequence {
+        *event_cursor = sequence.saturating_add(1);
+    }
+    if let Some(state) = page_state.as_mut() {
+        state.sync_replay_cutoffs_for_event(&event, event_log);
+        state.apply_target_transition(&event, session_id);
+    }
+    let replay_cutoff = event_session_id.and_then(|event_session_id| {
+        page_state
+            .as_ref()
+            .and_then(|state| state.replay_until.get(event_session_id).copied())
+            .or_else(|| replay_until.get(event_session_id).copied())
+    });
+    if matches!(
+        method,
+        Some("Runtime.consoleAPICalled") | Some("Runtime.exceptionThrown")
+    ) && replay_cutoff.is_some_and(|cutoff| {
+        event_sequence.is_some_and(|sequence| sequence < cutoff && sequence < replay_start_cursor)
+    }) {
+        return Ok(None);
+    }
+
+    if let Some(page) = page.as_ref() {
+        if method == Some("Target.attachedToTarget") {
+            #[cfg(test)]
+            wait_for_page_lifecycle_test_barrier(page, &event).await;
+            if let Some(child_session_id) = page_worker_session_from_attachment(page, &event) {
+                let page = Arc::clone(page);
+                tokio::spawn(async move {
+                    let setup_result = enable_console_capture_for_session_if_requested(
+                        &page,
+                        &child_session_id,
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                    if setup_result.is_err()
+                        || !wait_for_worker_forwarding_capture(
+                            &page,
+                            &child_session_id,
+                            Duration::from_secs(5),
+                        )
+                        .await
+                    {
+                        let _ = with_live_page_retention(&page, || {
+                            page.frame_state
+                                .lock()
+                                .unwrap()
+                                .mark_worker_resume_handoff_failed(&child_session_id);
+                        });
+                        return;
+                    }
+                    let _ =
+                        resume_worker_after_claim(&page, &child_session_id, Duration::from_secs(1))
+                            .await;
+                });
+            }
+            return Ok(None);
+        }
+        if method == Some("Target.detachedFromTarget") {
+            if let Some(detached_session_id) =
+                remove_page_worker_session_from_detachment(page, &event)
+            {
+                page.browser
+                    .client
+                    .event_log
+                    .lock()
+                    .unwrap()
+                    .finalize_console_replay_cutoff_on_detach(&detached_session_id, event_sequence);
+                clear_console_capture_for_session(page, &detached_session_id).await;
+            }
+            return Ok(None);
+        }
+    }
+
+    let matches_session = event_session_id == Some(session_id)
+        || page.as_ref().is_some_and(|page| {
+            event_session_id.is_some_and(|event_session_id| {
+                let owns_page_session = page_state
+                    .as_ref()
+                    .is_none_or(|state| state.owns_session(event_session_id));
+                let state = page.frame_state.lock().unwrap();
+                owns_page_session
+                    || (event_kind == "console" && state.owns_worker_session(event_session_id))
+            })
+        });
+    if !matches_session {
+        return Ok(None);
+    }
+    if event_kind == "console" {
+        if method != Some("Runtime.consoleAPICalled")
+            || !console_event_matches(&event, event_type, text, exact_text)
+        {
+            return Ok(None);
+        }
+        let Some(mut message) = console_from_event(&event) else {
+            return Ok(None);
+        };
+        if let Some(sequence) = event_sequence {
+            if let Some(object) = message.as_object_mut() {
+                object.insert("__rustwright_cdp_event_seq".to_string(), json!(sequence));
+            }
+        }
+        return Ok(Some(message.to_string()));
+    }
+    if method != Some("Runtime.exceptionThrown")
+        || !page_error_event_matches(&event, event_type, text, exact_text)
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        event
+            .get("params")
+            .cloned()
+            .unwrap_or(Value::Null)
+            .to_string(),
+    ))
+}
 async fn wait_for_console_event(
     events: &mut broadcast::Receiver<Value>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    browser: Arc<BrowserInner>,
     session_id: &str,
+    mut event_cursor: u64,
+    replay_until: &HashMap<String, u64>,
+    event_kind: &str,
+    page: Option<Arc<PageInner>>,
+    page_state: &mut Option<PageEventStreamState>,
+    event_type: Option<&str>,
+    text: Option<&str>,
+    exact_text: bool,
     timeout: Duration,
-) -> RwResult<String> {
+) -> (RwResult<String>, u64) {
+    let replay_start_cursor = event_cursor;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        if let Some(page) = page.as_deref() {
+            if let Some(error) = console_wait_owner_error(page) {
+                return (Err(error), event_cursor);
+            }
+        }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(RwError::Timeout(timeout.as_millis() as u64));
+            return (
+                Err(RwError::Timeout(timeout.as_millis() as u64)),
+                event_cursor,
+            );
         }
         let remaining = deadline - now;
-        match tokio::time::timeout(remaining, events.recv()).await {
-            Ok(Ok(event)) => {
-                let matches_session = event
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .map(|value| value == session_id)
-                    .unwrap_or(false);
-                if !matches_session {
-                    continue;
-                }
-                if event.get("method").and_then(Value::as_str) != Some("Runtime.consoleAPICalled") {
-                    continue;
-                }
-                if let Some(message) = console_from_event(&event) {
-                    return Ok(message.to_string());
+        let received = if page.is_some() {
+            tokio::select! {
+                event = events.recv() => Some(event),
+                _ = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => None,
+            }
+        } else {
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(event) => Some(event),
+                Err(_) => {
+                    return (
+                        Err(RwError::Timeout(timeout.as_millis() as u64)),
+                        event_cursor,
+                    )
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
-            Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
+        };
+        let Some(received) = received else {
+            continue;
+        };
+        match received {
+            Ok(event) => {
+                match process_console_wait_event(
+                    event,
+                    &mut event_cursor,
+                    replay_start_cursor,
+                    &event_log,
+                    session_id,
+                    replay_until,
+                    event_kind,
+                    page.clone(),
+                    page_state.as_mut(),
+                    event_type,
+                    text,
+                    exact_text,
+                )
+                .await
+                {
+                    Ok(Some(result)) => return (Ok(result), event_cursor),
+                    Ok(None) => {}
+                    Err(error) => return (Err(error), event_cursor),
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                let (replacement, oldest_seq, replay) = {
+                    let log = event_log.lock().unwrap();
+                    let replacement = browser.client.subscribe();
+                    let oldest_seq = log.oldest_seq();
+                    let replay = log.entries_since(event_cursor.max(oldest_seq));
+                    (replacement, oldest_seq, replay)
+                };
+                *events = replacement;
+                if event_cursor < oldest_seq {
+                    let dropped = oldest_seq - event_cursor;
+                    return (
+                        Err(RwError::Message(format!(
+                            "CDP event log overflow: dropped {dropped} event(s)"
+                        ))),
+                        event_cursor,
+                    );
+                }
+                for (_, event) in replay {
+                    match process_console_wait_event(
+                        event,
+                        &mut event_cursor,
+                        replay_start_cursor,
+                        &event_log,
+                        session_id,
+                        replay_until,
+                        event_kind,
+                        page.clone(),
+                        page_state.as_mut(),
+                        event_type,
+                        text,
+                        exact_text,
+                    )
+                    .await
+                    {
+                        Ok(Some(result)) => return (Ok(result), event_cursor),
+                        Ok(None) => {}
+                        Err(error) => return (Err(error), event_cursor),
+                    }
+                }
+            }
+            Err(_) => {
+                return (
+                    Err(RwError::Message("CDP event stream closed".to_string())),
+                    event_cursor,
+                );
+            }
         }
     }
 }
@@ -51295,6 +55649,7 @@ fn list_service_workers_for_context(
                     .to_string();
                 if let Ok(worker) = attach_existing_worker(
                     Arc::clone(&browser_for_task),
+                    None,
                     target_id.to_string(),
                     url,
                     timeout,
@@ -51417,62 +55772,160 @@ fn background_page_event_waiter_for_context(
 }
 
 #[cfg(feature = "python")]
+fn worker_from_attachment_event(
+    page: &Arc<PageInner>,
+    browser: &Arc<BrowserInner>,
+    event: &Value,
+) -> RwResult<Option<PyWorker>> {
+    if is_unreplayable_cdp_event(event) {
+        let sequence = cdp_event_sequence(event).unwrap_or_default();
+        return Err(RwError::Message(format!(
+            "CDP event log contains unreplayable worker event at sequence {sequence}"
+        )));
+    }
+    if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
+        return Ok(None);
+    }
+    let info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
+    if info.get("type").and_then(Value::as_str) != Some("worker") {
+        return Ok(None);
+    }
+    let Some(parent_session_id) = event.get("sessionId").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let target_id = info
+        .get("targetId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RwError::Message("worker target did not include targetId".to_string()))?
+        .to_string();
+    let session_id = event
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RwError::Message("worker target did not include sessionId".to_string()))?
+        .to_string();
+    let event_sequence = cdp_event_sequence(event);
+    let Some(()) = with_live_page_retention(page, || {
+        let mut state = page.frame_state.lock().unwrap();
+        if !state.owns_session(parent_session_id)
+            || !state.record_worker_target_session_at_sequence(
+                &target_id,
+                &session_id,
+                event_sequence,
+            )
+        {
+            return None;
+        }
+        state.arm_worker_resume_handoff(&session_id, event_sequence);
+        Some(())
+    })
+    .flatten() else {
+        return Ok(None);
+    };
+    let url = info
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(Some(PyWorker {
+        browser: Arc::clone(browser),
+        page: Some(Arc::clone(page)),
+        target_id,
+        session_id,
+        url,
+    }))
+}
+
+#[cfg(feature = "python")]
 async fn wait_for_worker(
     events: &mut broadcast::Receiver<Value>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    mut event_cursor: u64,
     browser: Arc<BrowserInner>,
-    opener_target_id: &str,
+    page: Arc<PageInner>,
     timeout: Duration,
-) -> RwResult<PyWorker> {
+) -> (RwResult<PyWorker>, u64) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(RwError::Timeout(timeout.as_millis() as u64));
+            return (
+                Err(RwError::Timeout(timeout.as_millis() as u64)),
+                event_cursor,
+            );
+        }
+        let (oldest_seq, entries) = {
+            let log = event_log.lock().unwrap();
+            (
+                log.oldest_seq(),
+                log.entries_since_limited(event_cursor, PAGE_EVENT_LOG_SCAN_CHUNK),
+            )
+        };
+        if event_cursor < oldest_seq {
+            let dropped = oldest_seq - event_cursor;
+            return (
+                Err(RwError::Message(format!(
+                    "CDP event log overflow: dropped {dropped} event(s)"
+                ))),
+                event_cursor,
+            );
+        }
+        for (sequence, event) in entries.iter() {
+            if *sequence < event_cursor {
+                continue;
+            }
+            event_cursor = sequence.saturating_add(1);
+            match worker_from_attachment_event(&page, &browser, event) {
+                Ok(Some(worker)) => return (Ok(worker), event_cursor),
+                Ok(None) => {}
+                Err(error) => return (Err(error), event_cursor),
+            }
+        }
+        if entries.len() >= PAGE_EVENT_LOG_SCAN_CHUNK {
+            continue;
         }
         let remaining = deadline - now;
         match tokio::time::timeout(remaining, events.recv()).await {
             Ok(Ok(event)) => {
-                if event.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
-                    continue;
+                if let Some(sequence) = cdp_event_sequence(&event) {
+                    if sequence < event_cursor {
+                        continue;
+                    }
+                    event_cursor = sequence.saturating_add(1);
                 }
-                let info = event.pointer("/params/targetInfo").unwrap_or(&Value::Null);
-                let target_type = info.get("type").and_then(Value::as_str).unwrap_or("");
-                if target_type != "worker" {
-                    continue;
+                match worker_from_attachment_event(&page, &browser, &event) {
+                    Ok(Some(worker)) => return (Ok(worker), event_cursor),
+                    Ok(None) => {}
+                    Err(error) => return (Err(error), event_cursor),
                 }
-                let opener = info.get("openerId").and_then(Value::as_str);
-                if opener.is_some() && opener != Some(opener_target_id) {
-                    continue;
-                }
-                let target_id = info
-                    .get("targetId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        RwError::Message("worker target did not include targetId".to_string())
-                    })?
-                    .to_string();
-                let session_id = event
-                    .pointer("/params/sessionId")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        RwError::Message("worker target did not include sessionId".to_string())
-                    })?
-                    .to_string();
-                let url = info
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                return Ok(PyWorker {
-                    browser,
-                    target_id,
-                    session_id,
-                    url,
-                });
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
-            Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                let (replacement, oldest_seq) = {
+                    let log = event_log.lock().unwrap();
+                    (browser.client.subscribe(), log.oldest_seq())
+                };
+                *events = replacement;
+                if event_cursor < oldest_seq {
+                    let dropped = oldest_seq - event_cursor;
+                    return (
+                        Err(RwError::Message(format!(
+                            "CDP event log overflow: dropped {dropped} event(s)"
+                        ))),
+                        event_cursor,
+                    );
+                }
+            }
+            Ok(Err(_)) => {
+                return (
+                    Err(RwError::Message("CDP event stream closed".to_string())),
+                    event_cursor,
+                )
+            }
+            Err(_) => {
+                return (
+                    Err(RwError::Timeout(timeout.as_millis() as u64)),
+                    event_cursor,
+                )
+            }
         }
     }
 }
@@ -51569,7 +56022,8 @@ async fn wait_for_service_worker(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                match attach_existing_worker(Arc::clone(&browser), target_id, url, remaining).await
+                match attach_existing_worker(Arc::clone(&browser), None, target_id, url, remaining)
+                    .await
                 {
                     Ok(worker) => return Ok(worker),
                     Err(_) => continue,
@@ -51584,38 +56038,124 @@ async fn wait_for_service_worker(
 
 async fn wait_for_worker_close(
     events: &mut broadcast::Receiver<Value>,
+    event_log: Arc<Mutex<CdpEventLog>>,
+    mut event_cursor: u64,
     target_id: &str,
     session_id: &str,
     timeout: Duration,
-) -> RwResult<()> {
+) -> (RwResult<()>, u64) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err(RwError::Timeout(timeout.as_millis() as u64));
+            return (
+                Err(RwError::Timeout(timeout.as_millis() as u64)),
+                event_cursor,
+            );
+        }
+        let (oldest_seq, entries) = {
+            let log = event_log.lock().unwrap();
+            (
+                log.oldest_seq(),
+                log.entries_since_limited(event_cursor, PAGE_EVENT_LOG_SCAN_CHUNK),
+            )
+        };
+        if event_cursor < oldest_seq {
+            let dropped = oldest_seq - event_cursor;
+            return (
+                Err(RwError::Message(format!(
+                    "CDP event log overflow: dropped {dropped} event(s)"
+                ))),
+                event_cursor,
+            );
+        }
+        for (sequence, event) in entries.iter() {
+            if *sequence < event_cursor {
+                continue;
+            }
+            event_cursor = sequence.saturating_add(1);
+            if is_unreplayable_cdp_event(event) {
+                return (
+                    Err(RwError::Message(format!(
+                        "CDP event log contains unreplayable worker-close event at sequence {sequence}"
+                    ))),
+                    event_cursor,
+                );
+            }
+            let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+            if method == "Target.detachedFromTarget"
+                && event.pointer("/params/sessionId").and_then(Value::as_str) == Some(session_id)
+            {
+                return (Ok(()), event_cursor);
+            }
+            if method == "Target.targetDestroyed"
+                && event.pointer("/params/targetId").and_then(Value::as_str) == Some(target_id)
+            {
+                return (Ok(()), event_cursor);
+            }
+        }
+        if entries.len() >= PAGE_EVENT_LOG_SCAN_CHUNK {
+            continue;
         }
         let remaining = deadline - now;
         match tokio::time::timeout(remaining, events.recv()).await {
             Ok(Ok(event)) => {
-                let method = event.get("method").and_then(Value::as_str).unwrap_or("");
-                if method == "Target.detachedFromTarget" {
-                    let detached_session =
-                        event.pointer("/params/sessionId").and_then(Value::as_str);
-                    if detached_session == Some(session_id) {
-                        return Ok(());
+                if let Some(sequence) = cdp_event_sequence(&event) {
+                    if sequence < event_cursor {
+                        continue;
                     }
+                    event_cursor = sequence.saturating_add(1);
                 }
-                if method == "Target.targetDestroyed" {
-                    let destroyed_target =
-                        event.pointer("/params/targetId").and_then(Value::as_str);
-                    if destroyed_target == Some(target_id) {
-                        return Ok(());
-                    }
+                if is_unreplayable_cdp_event(&event) {
+                    let sequence = cdp_event_sequence(&event).unwrap_or_default();
+                    return (
+                        Err(RwError::Message(format!(
+                            "CDP event log contains unreplayable worker-close event at sequence {sequence}"
+                        ))),
+                        event_cursor,
+                    );
+                }
+                let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "Target.detachedFromTarget"
+                    && event.pointer("/params/sessionId").and_then(Value::as_str)
+                        == Some(session_id)
+                {
+                    return (Ok(()), event_cursor);
+                }
+                if method == "Target.targetDestroyed"
+                    && event.pointer("/params/targetId").and_then(Value::as_str) == Some(target_id)
+                {
+                    return (Ok(()), event_cursor);
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return Err(RwError::Message("CDP event stream closed".to_string())),
-            Err(_) => return Err(RwError::Timeout(timeout.as_millis() as u64)),
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                let (replacement, oldest_seq) = {
+                    let log = event_log.lock().unwrap();
+                    (events.resubscribe(), log.oldest_seq())
+                };
+                *events = replacement;
+                if event_cursor < oldest_seq {
+                    let dropped = oldest_seq - event_cursor;
+                    return (
+                        Err(RwError::Message(format!(
+                            "CDP event log overflow: dropped {dropped} event(s)"
+                        ))),
+                        event_cursor,
+                    );
+                }
+            }
+            Ok(Err(_)) => {
+                return (
+                    Err(RwError::Message("CDP event stream closed".to_string())),
+                    event_cursor,
+                )
+            }
+            Err(_) => {
+                return (
+                    Err(RwError::Timeout(timeout.as_millis() as u64)),
+                    event_cursor,
+                )
+            }
         }
     }
 }
@@ -52005,6 +56545,13 @@ fn navigation_timeout(deadline: OperationDeadline) -> RwError {
     RwError::Timeout(duration_millis_u64(deadline.timeout))
 }
 
+fn normalize_navigation_timeout(error: RwError, deadline: OperationDeadline) -> RwError {
+    match error {
+        RwError::Timeout(_) => navigation_timeout(deadline),
+        error => error,
+    }
+}
+
 fn navigation_ready_state_satisfies(state: &str, ready_state: &str) -> bool {
     match state {
         "domcontentloaded" => matches!(ready_state, "interactive" | "complete"),
@@ -52219,6 +56766,12 @@ fn process_navigation_event(
     restore_initiation_cursor: Option<u64>,
     matcher: &mut NavigationEventState,
 ) -> RwResult<Option<NavigationWaitResult>> {
+    if is_unreplayable_cdp_event(event) {
+        let sequence = cdp_event_sequence(event).unwrap_or_default();
+        return Err(RwError::Message(format!(
+            "CDP event log contains unreplayable navigation event at sequence {sequence}"
+        )));
+    }
     if event.get("sessionId").and_then(Value::as_str) != Some(session_id) {
         return Ok(None);
     }
@@ -53163,6 +57716,632 @@ const WIRE_LEAF_TAGS: [&str; 9] = [
     "__rustwright_cdp_function__",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WireNodeId(usize);
+
+impl WireNodeId {
+    pub fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WireNumber {
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WireLeaf {
+    Unserializable(String),
+    BigInt(String),
+    Date(String),
+    RegExp {
+        pattern: String,
+        flags: String,
+    },
+    Url(String),
+    Error {
+        name: String,
+        message: String,
+        stack: String,
+    },
+    Undefined,
+    Symbol,
+    Function,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WireNodeKind {
+    Null,
+    Bool(bool),
+    Number(WireNumber),
+    String(String),
+    Array(Vec<WireNodeId>),
+    Object(Vec<(String, WireNodeId)>),
+    Leaf(WireLeaf),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WireGraph {
+    root: WireNodeId,
+    nodes: Vec<WireNodeKind>,
+}
+
+impl WireGraph {
+    pub fn root(&self) -> WireNodeId {
+        self.root
+    }
+
+    pub fn nodes(&self) -> &[WireNodeKind] {
+        &self.nodes
+    }
+
+    pub fn node(&self, id: WireNodeId) -> Option<&WireNodeKind> {
+        self.nodes.get(id.index())
+    }
+}
+
+enum WireJsonValue {
+    Null,
+    Bool(bool),
+    Number(WireNumber),
+    String(String),
+    Array(Vec<WireJsonValue>),
+    Object(Vec<(String, WireJsonValue)>),
+}
+
+impl<'de> Deserialize<'de> for WireJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct WireJsonValueVisitor;
+
+        impl<'de> Visitor<'de> for WireJsonValueVisitor {
+            type Value = WireJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Null)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Number(WireNumber::Signed(value)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Number(WireNumber::Unsigned(value)))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::Number(WireNumber::Float(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::String(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(WireJsonValue::String(value))
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                while let Some(value) = sequence.next_element()? {
+                    values.push(value);
+                }
+                Ok(WireJsonValue::Array(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(WireJsonValue::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(WireJsonValueVisitor)
+    }
+}
+
+type WireJsonObject = Vec<(String, WireJsonValue)>;
+
+#[derive(Clone, Copy)]
+enum WireStructuralKind {
+    Ref,
+    Array,
+    Object,
+}
+
+fn wire_json_object_get<'a>(object: &'a WireJsonObject, key: &str) -> Option<&'a WireJsonValue> {
+    object
+        .iter()
+        .rev()
+        .find_map(|(name, value)| (name == key).then_some(value))
+}
+
+fn wire_json_object_contains(object: &WireJsonObject, key: &str) -> bool {
+    object.iter().any(|(name, _)| name == key)
+}
+
+fn wire_structural_kind(object: &WireJsonObject) -> RwResult<Option<WireStructuralKind>> {
+    let mut result = None;
+    for (tag, kind) in [
+        (WIRE_REF_TAG, WireStructuralKind::Ref),
+        (WIRE_ARRAY_TAG, WireStructuralKind::Array),
+        (WIRE_OBJECT_TAG, WireStructuralKind::Object),
+    ] {
+        if wire_json_object_contains(object, tag) {
+            if result.is_some() {
+                return Err(RwError::InvalidInput(
+                    "wire wrapper contains multiple structural tags".to_string(),
+                ));
+            }
+            result = Some(kind);
+        }
+    }
+    Ok(result)
+}
+
+fn wire_leaf_value(object: &WireJsonObject) -> RwResult<Option<WireLeaf>> {
+    let tags = WIRE_LEAF_TAGS
+        .iter()
+        .copied()
+        .filter(|tag| wire_json_object_contains(object, tag))
+        .collect::<Vec<_>>();
+    if tags.is_empty() {
+        return Ok(None);
+    }
+    if tags.len() != 1 || object.len() != 1 {
+        return Err(RwError::InvalidInput(
+            "wire leaf wrapper must contain exactly one leaf tag".to_string(),
+        ));
+    }
+    let tag = tags[0];
+    let payload = wire_json_object_get(object, tag).expect("leaf tag was found");
+    let string_payload = |message: &str| {
+        if let WireJsonValue::String(value) = payload {
+            Ok(value.clone())
+        } else {
+            Err(RwError::InvalidInput(message.to_string()))
+        }
+    };
+    let leaf = match tag {
+        "__rustwright_cdp_unserializable_value__" => {
+            let payload = string_payload("wire unserializable leaf payload must be a string")?;
+            if let Some(value) = payload.strip_suffix('n') {
+                WireLeaf::BigInt(value.to_string())
+            } else {
+                WireLeaf::Unserializable(payload)
+            }
+        }
+        "__rustwright_cdp_bigint__" => {
+            let payload = string_payload("wire bigint leaf payload must be a string")?;
+            WireLeaf::BigInt(payload.strip_suffix('n').unwrap_or(&payload).to_string())
+        }
+        "__rustwright_cdp_date__" => {
+            WireLeaf::Date(string_payload("wire date leaf payload must be a string")?)
+        }
+        "__rustwright_cdp_regexp__" => {
+            let regexp = match payload {
+                WireJsonValue::Object(regexp) => regexp,
+                _ => {
+                    return Err(RwError::InvalidInput(
+                        "wire regexp leaf payload must be an object".to_string(),
+                    ));
+                }
+            };
+            if regexp.len() != 2 {
+                return Err(RwError::InvalidInput(
+                    "wire regexp leaf payload must contain pattern and flags".to_string(),
+                ));
+            }
+            let string_field = |name: &str| {
+                wire_json_object_get(regexp, name).and_then(|value| match value {
+                    WireJsonValue::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+            };
+            let pattern = string_field("p")
+                .or_else(|| string_field("pattern"))
+                .ok_or_else(|| {
+                    RwError::InvalidInput("wire regexp pattern must be a string".to_string())
+                })?;
+            let flags = string_field("f")
+                .or_else(|| string_field("flags"))
+                .ok_or_else(|| {
+                    RwError::InvalidInput("wire regexp flags must be a string".to_string())
+                })?;
+            WireLeaf::RegExp { pattern, flags }
+        }
+        "__rustwright_cdp_url__" => {
+            WireLeaf::Url(string_payload("wire url leaf payload must be a string")?)
+        }
+        "__rustwright_cdp_error__" => {
+            let error = match payload {
+                WireJsonValue::Object(error) => error,
+                _ => {
+                    return Err(RwError::InvalidInput(
+                        "wire error leaf payload must be an object".to_string(),
+                    ));
+                }
+            };
+            if error.len() != 3 {
+                return Err(RwError::InvalidInput(
+                    "wire error leaf payload must contain name, message, and stack".to_string(),
+                ));
+            }
+            let string_field = |name: &str| {
+                wire_json_object_get(error, name)
+                    .and_then(|value| match value {
+                        WireJsonValue::String(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        RwError::InvalidInput(format!("wire error field must be a string: {name}"))
+                    })
+            };
+            WireLeaf::Error {
+                name: string_field("name")?,
+                message: string_field("message")?,
+                stack: string_field("stack")?,
+            }
+        }
+        "__rustwright_cdp_undefined__" => WireLeaf::Undefined,
+        "__rustwright_cdp_symbol__" => WireLeaf::Symbol,
+        "__rustwright_cdp_function__" => WireLeaf::Function,
+        _ => unreachable!("all wire leaf tags are listed in WIRE_LEAF_TAGS"),
+    };
+    Ok(Some(leaf))
+}
+
+fn wire_graph_reference_key(value: &WireJsonValue) -> RwResult<String> {
+    match value {
+        WireJsonValue::Number(WireNumber::Signed(value)) => Ok(value.to_string()),
+        WireJsonValue::Number(WireNumber::Unsigned(value)) => Ok(value.to_string()),
+        WireJsonValue::Number(WireNumber::Float(value)) => {
+            serde_json::to_string(value).map_err(RwError::from)
+        }
+        WireJsonValue::String(value) => serde_json::to_string(value).map_err(RwError::from),
+        _ => Err(RwError::InvalidInput(
+            "wire reference id must be a number or string".to_string(),
+        )),
+    }
+}
+
+fn wire_wrapper_id(object: &WireJsonObject, tag: &str) -> RwResult<String> {
+    wire_graph_reference_key(wire_json_object_get(object, tag).ok_or_else(|| {
+        RwError::InvalidInput(format!("wire wrapper is missing its id tag: {tag}"))
+    })?)
+}
+
+fn wire_array_items(object: &WireJsonObject) -> RwResult<&[WireJsonValue]> {
+    if object.len() != 2 {
+        return Err(RwError::InvalidInput(
+            "wire array wrapper must contain only id and items".to_string(),
+        ));
+    }
+    match wire_json_object_get(object, "items") {
+        Some(WireJsonValue::Array(items)) => Ok(items),
+        _ => Err(RwError::InvalidInput(
+            "wire array wrapper must contain an items array".to_string(),
+        )),
+    }
+}
+
+fn wire_object_entries(object: &WireJsonObject) -> RwResult<&WireJsonObject> {
+    if object.len() != 2 {
+        return Err(RwError::InvalidInput(
+            "wire object wrapper must contain only id and entries".to_string(),
+        ));
+    }
+    match wire_json_object_get(object, "entries") {
+        Some(WireJsonValue::Object(entries)) => Ok(entries),
+        _ => Err(RwError::InvalidInput(
+            "wire object wrapper must contain an entries object".to_string(),
+        )),
+    }
+}
+
+struct WireGraphParser {
+    definitions: HashMap<String, WireNodeId>,
+    built: HashSet<WireNodeId>,
+    nodes: Vec<WireNodeKind>,
+}
+
+impl WireGraphParser {
+    fn new() -> Self {
+        Self {
+            definitions: HashMap::new(),
+            built: HashSet::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    fn reserve_definition(&mut self, key: String) -> RwResult<WireNodeId> {
+        if self.definitions.contains_key(&key) {
+            return Err(RwError::InvalidInput(format!(
+                "wire reference id is defined more than once: {key}"
+            )));
+        }
+        let id = WireNodeId(self.nodes.len());
+        self.nodes.push(WireNodeKind::Null);
+        self.definitions.insert(key, id);
+        Ok(id)
+    }
+
+    fn collect_definitions(&mut self, value: &WireJsonValue) -> RwResult<()> {
+        match value {
+            WireJsonValue::Array(values) => {
+                for value in values {
+                    self.collect_definitions(value)?;
+                }
+            }
+            WireJsonValue::Object(object) => {
+                if wire_leaf_value(object)?.is_some() {
+                    return Ok(());
+                }
+                match wire_structural_kind(object)? {
+                    None => {
+                        for (_, value) in object {
+                            self.collect_definitions(value)?;
+                        }
+                    }
+                    Some(WireStructuralKind::Ref) => {
+                        if object.len() != 1 {
+                            return Err(RwError::InvalidInput(
+                                "wire ref wrapper must contain only its id".to_string(),
+                            ));
+                        }
+                        wire_wrapper_id(object, WIRE_REF_TAG)?;
+                    }
+                    Some(WireStructuralKind::Array) => {
+                        let key = wire_wrapper_id(object, WIRE_ARRAY_TAG)?;
+                        let items = wire_array_items(object)?;
+                        self.reserve_definition(key)?;
+                        for item in items {
+                            self.collect_definitions(item)?;
+                        }
+                    }
+                    Some(WireStructuralKind::Object) => {
+                        let key = wire_wrapper_id(object, WIRE_OBJECT_TAG)?;
+                        let entries = wire_object_entries(object)?;
+                        self.reserve_definition(key)?;
+                        for (_, value) in entries {
+                            self.collect_definitions(value)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn allocate(&mut self, kind: WireNodeKind) -> WireNodeId {
+        let id = WireNodeId(self.nodes.len());
+        self.nodes.push(kind);
+        id
+    }
+
+    fn definition(&self, key: &str) -> RwResult<WireNodeId> {
+        self.definitions.get(key).copied().ok_or_else(|| {
+            RwError::InvalidInput(format!("wire reference points to unknown id: {key}"))
+        })
+    }
+
+    fn build_value(&mut self, value: &WireJsonValue) -> RwResult<WireNodeId> {
+        match value {
+            WireJsonValue::Null => Ok(self.allocate(WireNodeKind::Null)),
+            WireJsonValue::Bool(value) => Ok(self.allocate(WireNodeKind::Bool(*value))),
+            WireJsonValue::Number(value) => Ok(self.allocate(WireNodeKind::Number(*value))),
+            WireJsonValue::String(value) => Ok(self.allocate(WireNodeKind::String(value.clone()))),
+            WireJsonValue::Array(values) => {
+                let id = self.allocate(WireNodeKind::Array(Vec::new()));
+                let children = values
+                    .iter()
+                    .map(|value| self.build_value(value))
+                    .collect::<RwResult<Vec<_>>>()?;
+                self.nodes[id.index()] = WireNodeKind::Array(children);
+                Ok(id)
+            }
+            WireJsonValue::Object(object) => {
+                if let Some(leaf) = wire_leaf_value(object)? {
+                    return Ok(self.allocate(WireNodeKind::Leaf(leaf)));
+                }
+                match wire_structural_kind(object)? {
+                    None => {
+                        let id = self.allocate(WireNodeKind::Object(Vec::new()));
+                        let mut entries = Vec::with_capacity(object.len());
+                        for (key, value) in object {
+                            entries.push((key.clone(), self.build_value(value)?));
+                        }
+                        self.nodes[id.index()] = WireNodeKind::Object(entries);
+                        Ok(id)
+                    }
+                    Some(WireStructuralKind::Ref) => {
+                        if object.len() != 1 {
+                            return Err(RwError::InvalidInput(
+                                "wire ref wrapper must contain only its id".to_string(),
+                            ));
+                        }
+                        let key = wire_wrapper_id(object, WIRE_REF_TAG)?;
+                        self.definition(&key)
+                    }
+                    Some(WireStructuralKind::Array) => {
+                        let key = wire_wrapper_id(object, WIRE_ARRAY_TAG)?;
+                        let id = self.definition(&key)?;
+                        if self.built.insert(id) {
+                            let items = wire_array_items(object)?;
+                            let children = items
+                                .iter()
+                                .map(|value| self.build_value(value))
+                                .collect::<RwResult<Vec<_>>>()?;
+                            self.nodes[id.index()] = WireNodeKind::Array(children);
+                        }
+                        Ok(id)
+                    }
+                    Some(WireStructuralKind::Object) => {
+                        let key = wire_wrapper_id(object, WIRE_OBJECT_TAG)?;
+                        let id = self.definition(&key)?;
+                        if self.built.insert(id) {
+                            let entries = wire_object_entries(object)?;
+                            let mut children = Vec::with_capacity(entries.len());
+                            for (key, value) in entries {
+                                children.push((key.clone(), self.build_value(value)?));
+                            }
+                            self.nodes[id.index()] = WireNodeKind::Object(children);
+                        }
+                        Ok(id)
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn parse_wire_graph(json: &str) -> RwResult<WireGraph> {
+    let value = serde_json::from_str::<WireJsonValue>(json)?;
+    let mut parser = WireGraphParser::new();
+    parser.collect_definitions(&value)?;
+    let root = parser.build_value(&value)?;
+    Ok(WireGraph {
+        root,
+        nodes: parser.nodes,
+    })
+}
+#[cfg(feature = "python")]
+fn py_wire_leaf(py: Python<'_>, callback: &Py<PyAny>, leaf: &WireLeaf) -> PyResult<Py<PyAny>> {
+    let (tag, payload) = match leaf {
+        WireLeaf::Unserializable(value) => (
+            "unserializable",
+            value.clone().into_pyobject(py)?.unbind().into_any(),
+        ),
+        WireLeaf::BigInt(value) => (
+            "bigint",
+            value.clone().into_pyobject(py)?.unbind().into_any(),
+        ),
+        WireLeaf::Date(value) => ("date", value.clone().into_pyobject(py)?.unbind().into_any()),
+        WireLeaf::RegExp { pattern, flags } => {
+            let payload = PyDict::new(py);
+            payload.set_item("pattern", pattern)?;
+            payload.set_item("flags", flags)?;
+            ("regexp", payload.unbind().into_any())
+        }
+        WireLeaf::Url(value) => ("url", value.clone().into_pyobject(py)?.unbind().into_any()),
+        WireLeaf::Error {
+            name,
+            message,
+            stack,
+        } => {
+            let payload = PyDict::new(py);
+            payload.set_item("name", name)?;
+            payload.set_item("message", message)?;
+            payload.set_item("stack", stack)?;
+            ("error", payload.unbind().into_any())
+        }
+        WireLeaf::Undefined => ("undefined", py.None()),
+        WireLeaf::Symbol => ("symbol", py.None()),
+        WireLeaf::Function => ("function", py.None()),
+    };
+    Ok(callback
+        .bind(py)
+        .call1((tag, payload.bind(py)))?
+        .unbind()
+        .into_any())
+}
+
+#[cfg(feature = "python")]
+fn py_wire_node(py: Python<'_>, callback: &Py<PyAny>, kind: &WireNodeKind) -> PyResult<Py<PyAny>> {
+    match kind {
+        WireNodeKind::Null => Ok(py.None()),
+        WireNodeKind::Bool(value) => (*value).into_py_any(py),
+        WireNodeKind::Number(WireNumber::Signed(value)) => (*value).into_py_any(py),
+        WireNodeKind::Number(WireNumber::Unsigned(value)) => (*value).into_py_any(py),
+        WireNodeKind::Number(WireNumber::Float(value)) => (*value).into_py_any(py),
+        WireNodeKind::String(value) => value.clone().into_py_any(py),
+        WireNodeKind::Array(_) => Ok(PyList::empty(py).unbind().into_any()),
+        WireNodeKind::Object(_) => Ok(PyDict::new(py).unbind().into_any()),
+        WireNodeKind::Leaf(leaf) => py_wire_leaf(py, callback, leaf),
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyfunction]
+fn _decode_wire_value(
+    py: Python<'_>,
+    wire_json: &str,
+    leaf_callback: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let graph = parse_wire_graph(wire_json).map_err(py_err)?;
+    let callback = leaf_callback;
+    let values = graph
+        .nodes()
+        .iter()
+        .map(|kind| py_wire_node(py, &callback, kind))
+        .collect::<PyResult<Vec<_>>>()?;
+    for (index, kind) in graph.nodes().iter().enumerate() {
+        match kind {
+            WireNodeKind::Array(children) => {
+                let list = values[index].bind(py).cast::<PyList>()?;
+                for child in children {
+                    list.append(values[child.index()].bind(py))?;
+                }
+            }
+            WireNodeKind::Object(entries) => {
+                let object = values[index].bind(py).cast::<PyDict>()?;
+                for (key, child) in entries {
+                    object.set_item(key, values[child.index()].bind(py))?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(values[graph.root().index()].clone_ref(py))
+}
+
 #[derive(Clone)]
 enum WireDefinition {
     Array(Vec<Value>),
@@ -53422,6 +58601,209 @@ mod wire_decode_tests {
         let error = decode_wire_value(r#"{"unterminated": [1, 2}"#).unwrap_err();
 
         assert!(matches!(error, RwError::Json(_)));
+    }
+    #[test]
+    fn parses_nested_values_and_all_wire_leaves() {
+        let graph = parse_wire_graph(
+            r#"{
+                "__rustwright_cdp_object__": 1,
+                "entries": {
+                    "nested": {
+                        "__rustwright_cdp_array__": 2,
+                        "items": [
+                            null,
+                            true,
+                            -7,
+                            1.25,
+                            "text",
+                            {"__rustwright_cdp_unserializable_value__": "NaN"},
+                            {"__rustwright_cdp_bigint__": "123n"},
+                            {"__rustwright_cdp_date__": "2026-07-21T12:34:56.789Z"},
+                            {"__rustwright_cdp_regexp__": {"p": "a+b", "f": "gi"}},
+                            {"__rustwright_cdp_url__": "https://example.com/path"},
+                            {"__rustwright_cdp_error__": {
+                                "name": "TypeError",
+                                "message": "broken",
+                                "stack": "TypeError: broken"
+                            }},
+                            {"__rustwright_cdp_undefined__": true},
+                            {"__rustwright_cdp_symbol__": true},
+                            {"__rustwright_cdp_function__": true}
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let WireNodeKind::Object(entries) = graph.node(graph.root()).unwrap() else {
+            panic!("root must be an object");
+        };
+        let nested = entries
+            .iter()
+            .find(|(key, _)| key == "nested")
+            .map(|(_, id)| *id)
+            .unwrap();
+        let WireNodeKind::Array(items) = graph.node(nested).unwrap() else {
+            panic!("nested value must be an array");
+        };
+        assert!(matches!(graph.node(items[0]), Some(WireNodeKind::Null)));
+        assert!(matches!(
+            graph.node(items[1]),
+            Some(WireNodeKind::Bool(true))
+        ));
+        assert!(matches!(
+            graph.node(items[2]),
+            Some(WireNodeKind::Number(WireNumber::Signed(-7)))
+        ));
+        assert!(matches!(
+            graph.node(items[3]),
+            Some(WireNodeKind::Number(WireNumber::Float(value))) if (*value - 1.25).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            graph.node(items[4]),
+            Some(WireNodeKind::String(value)) if value == "text"
+        ));
+        assert!(matches!(
+            graph.node(items[5]),
+            Some(WireNodeKind::Leaf(WireLeaf::Unserializable(value))) if value == "NaN"
+        ));
+        assert!(matches!(
+            graph.node(items[6]),
+            Some(WireNodeKind::Leaf(WireLeaf::BigInt(value))) if value == "123"
+        ));
+        assert!(matches!(
+            graph.node(items[7]),
+            Some(WireNodeKind::Leaf(WireLeaf::Date(value))) if value == "2026-07-21T12:34:56.789Z"
+        ));
+        assert!(matches!(
+            graph.node(items[8]),
+            Some(WireNodeKind::Leaf(WireLeaf::RegExp { pattern, flags }))
+                if pattern == "a+b" && flags == "gi"
+        ));
+        assert!(matches!(
+            graph.node(items[9]),
+            Some(WireNodeKind::Leaf(WireLeaf::Url(value))) if value == "https://example.com/path"
+        ));
+        assert!(matches!(
+            graph.node(items[10]),
+            Some(WireNodeKind::Leaf(WireLeaf::Error { name, message, stack }))
+                if name == "TypeError" && message == "broken" && stack == "TypeError: broken"
+        ));
+        assert!(matches!(
+            graph.node(items[11]),
+            Some(WireNodeKind::Leaf(WireLeaf::Undefined))
+        ));
+        assert!(matches!(
+            graph.node(items[12]),
+            Some(WireNodeKind::Leaf(WireLeaf::Symbol))
+        ));
+        assert!(matches!(
+            graph.node(items[13]),
+            Some(WireNodeKind::Leaf(WireLeaf::Function))
+        ));
+    }
+
+    #[test]
+    fn preserves_plain_and_wrapped_object_insertion_order() {
+        let graph = parse_wire_graph(
+            r#"{
+                "z": 1,
+                "a": 2,
+                "wrapped": {
+                    "__rustwright_cdp_object__": "obj",
+                    "entries": {
+                        "z": {
+                            "__rustwright_cdp_regexp__": {"f": "gi", "p": "a+b"}
+                        },
+                        "a": {
+                            "__rustwright_cdp_error__": {
+                                "stack": "TypeError: broken",
+                                "message": "broken",
+                                "name": "TypeError"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let WireNodeKind::Object(entries) = graph.node(graph.root()).unwrap() else {
+            panic!("root must be an object");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a", "wrapped"]
+        );
+        let wrapped = entries
+            .iter()
+            .find(|(key, _)| key == "wrapped")
+            .map(|(_, id)| *id)
+            .unwrap();
+        let WireNodeKind::Object(wrapped_entries) = graph.node(wrapped).unwrap() else {
+            panic!("wrapped value must be an object");
+        };
+        assert_eq!(
+            wrapped_entries
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "a"]
+        );
+        assert!(matches!(
+            graph.node(wrapped_entries[0].1),
+            Some(WireNodeKind::Leaf(WireLeaf::RegExp { pattern, flags }))
+                if pattern == "a+b" && flags == "gi"
+        ));
+        assert!(matches!(
+            graph.node(wrapped_entries[1].1),
+            Some(WireNodeKind::Leaf(WireLeaf::Error { name, message, stack }))
+                if name == "TypeError" && message == "broken" && stack == "TypeError: broken"
+        ));
+    }
+
+    #[test]
+    fn preserves_repeated_identity_cycles_and_forward_references() {
+        let graph = parse_wire_graph(
+            r#"{
+                "__rustwright_cdp_array__": 1,
+                "items": [
+                    {"__rustwright_cdp_ref__": 2},
+                    {
+                        "__rustwright_cdp_object__": 2,
+                        "entries": {"self": {"__rustwright_cdp_ref__": 2}}
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let WireNodeKind::Array(items) = graph.node(graph.root()).unwrap() else {
+            panic!("root must be an array");
+        };
+        assert_eq!(items[0], items[1]);
+        let WireNodeKind::Object(entries) = graph.node(items[0]).unwrap() else {
+            panic!("repeated value must be an object");
+        };
+        assert_eq!(entries[0].1, items[0]);
+    }
+
+    #[test]
+    fn rejects_duplicate_unknown_and_malformed_wire_wrappers() {
+        for input in [
+            r#"[{"__rustwright_cdp_array__": 1, "items": []}, {"__rustwright_cdp_array__": 1, "items": []}]"#,
+            r#"{"__rustwright_cdp_ref__": 999}"#,
+            r#"{"__rustwright_cdp_array__": 1}"#,
+            r#"{"__rustwright_cdp_object__": 1, "entries": [], "extra": true}"#,
+            r#"{"__rustwright_cdp_ref__": 1, "extra": true}"#,
+        ] {
+            assert!(matches!(
+                parse_wire_graph(input),
+                Err(RwError::InvalidInput(_))
+            ));
+        }
     }
 }
 
@@ -56317,6 +61699,7 @@ fn _rustwright(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyWorkerCloseEventWaiter>()?;
     module.add_class::<PyServiceWorkerEventWaiter>()?;
     module.add_class::<PyBackgroundPageEventWaiter>()?;
+    module.add_function(wrap_pyfunction!(_decode_wire_value, module)?)?;
     module.add_function(wrap_pyfunction!(launch_chromium, module)?)?;
     module.add_function(wrap_pyfunction!(launch_chromium_async, module)?)?;
     module.add_function(wrap_pyfunction!(connect_over_cdp, module)?)?;
@@ -56338,4 +61721,106 @@ fn _rustwright(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add("_LOCATOR_FILL_TEMPLATE", LOCATOR_FILL_TEMPLATE)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod event_waiter_matcher_tests {
+    use super::*;
+
+    #[test]
+    fn console_matcher_supports_type_and_exact_or_substring_text() {
+        let event = json!({
+            "params": {
+                "type": "error",
+                "args": [{"type": "string", "value": "prefix exact suffix"}]
+            }
+        });
+        assert!(console_event_matches(
+            &event,
+            Some("error"),
+            Some("prefix exact suffix"),
+            true
+        ));
+        assert!(!console_event_matches(
+            &event,
+            Some("warning"),
+            Some("prefix exact suffix"),
+            true
+        ));
+        assert!(console_event_matches(
+            &event,
+            Some("error"),
+            Some("exact"),
+            false
+        ));
+        assert!(!console_event_matches(
+            &event,
+            Some("error"),
+            Some("exact"),
+            true
+        ));
+    }
+
+    #[test]
+    fn page_error_text_uses_python_truthy_fallbacks() {
+        let fixtures = [
+            (
+                json!({
+                    "description": Value::Null,
+                    "value": "TypeError: value fallback",
+                }),
+                "outer fallback",
+                "value fallback",
+            ),
+            (
+                json!({
+                    "description": "",
+                    "value": "",
+                }),
+                "ReferenceError: text fallback",
+                "text fallback",
+            ),
+        ];
+        for (exception, details_text, expected) in fixtures {
+            let event = json!({
+                "params": {
+                    "exceptionDetails": {
+                        "exception": exception,
+                        "text": details_text,
+                    },
+                },
+            });
+            assert_eq!(page_error_event_text(&event).0, expected);
+        }
+    }
+
+    #[test]
+    fn page_error_matcher_uses_error_name_and_normalized_message() {
+        let event = json!({
+            "params": {
+                "exceptionDetails": {
+                    "exception": {
+                        "className": "TypeError",
+                        "description": "TypeError: missing value\n    at example.js:1"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            page_error_event_text(&event),
+            ("missing value".to_string(), "TypeError".to_string())
+        );
+        assert!(page_error_event_matches(
+            &event,
+            Some("TypeError"),
+            Some("missing"),
+            false
+        ));
+        assert!(!page_error_event_matches(
+            &event,
+            Some("Error"),
+            Some("missing value"),
+            true
+        ));
+    }
 }

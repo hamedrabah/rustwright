@@ -4,6 +4,48 @@ All notable user-facing changes to Rustwright are documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+
+- Removed `disable_playwright_compat()`. Compatibility aliases are now a one-way
+  process opt-in.
+- Removed `RUSTWRIGHT_UNSAFE_DOM_FASTPATH`. Click, fill, check, and select
+  actions always use the trusted native action path.
+- Promoted one MCP behavior profile for every client. Snapshot distillation,
+  page headers, console deduplication, network notes, compact descriptions, and
+  9 KiB/200-line response limits are now the defaults.
+
+### Changed
+
+- `Browser.new_page()` now creates a native ephemeral browser context for each
+  page. Closing the page disposes its context, matching Playwright isolation.
+- Navigation internals now retain response bodies and drain console and
+  page-error history before each navigation.
+- Navigation response retention now bounds page-owned navigation-response
+  entries to 20 and all page-owned response-body storage, including staged
+  fulfilled-route bodies, to 8 MiB. Evicted responses release page-owned
+  request, response, and fulfilled-body links, while a
+  caller-retained `Response` keeps its cached body readable after eviction
+  and later renderer-changing navigation.
+- Process-tree benchmark memory summaries report RSS on every platform and
+  include Linux PSS fields (`pss_tree_kb`, `pss_by_role_kb`, `pss_available`,
+  and `pss_required`) when PSS is available. Role medians are independent
+  marginal medians.
+- Chromium launches now include a broader resource-safe default switch set.
+- User-provided feature-list launch arguments now merge with defaults into one
+  switch per feature flag.
+
+- Network request filters now accept the standard Rust `regex` syntax.
+
+- Console and page-error event waiters now block in Rust and apply exact or
+  substring text filters without Python polling. Console and page-error
+  listeners use the persistent event pump. Once/remove cleanup detaches worker
+  console forwarding and page close reaps worker listener threads.
+
+### Fixed
+
+- Fixed native drag-and-drop to stop dispatching trailing pointer and mouse release events after a completed drop.
+- Hardened sync and async context creation rollback and close disposal retries.
+
 ### Documentation
 
 - Added a Mintlify documentation configuration, quickstart, and guide to the
